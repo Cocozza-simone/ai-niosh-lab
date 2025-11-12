@@ -48,6 +48,8 @@ import random
 import requests
 import copy
 import re
+from decimal import Decimal, InvalidOperation
+from typing import Set, Tuple
 from pathlib import Path
 from datetime import datetime
 from niosh_calculator_v2 import calculate_niosh_v2
@@ -192,7 +194,7 @@ def clean_narrative_language(text: str) -> str:
 def apply_comprehensive_niosh_linguistic_filtering(report_text: str) -> str:
     """
     Apply comprehensive linguistic filtering to entire NIOSH report.
-    
+
     This function processes the complete report to ensure it conforms
     to NIOSH manual writing standards with assertive, direct language.
     """
@@ -235,6 +237,116 @@ def apply_comprehensive_niosh_linguistic_filtering(report_text: str) -> str:
     
     print("Linguistic filtering completed")
     return filtered_report
+
+
+def _normalize_numeric_token(token: str) -> str:
+    """Normalize numeric strings so comparisons remain stable."""
+
+    try:
+        value = Decimal(token)
+    except (InvalidOperation, TypeError):
+        return token.strip()
+
+    if value == value.to_integral():
+        return str(int(value))
+
+    normalized = format(value.normalize(), 'f')
+    return normalized.rstrip('0').rstrip('.') if '.' in normalized else normalized
+
+
+_STYLE_STOPWORDS = {
+    "the",
+    "and",
+    "with",
+    "from",
+    "that",
+    "this",
+    "into",
+    "onto",
+    "over",
+    "worker",
+    "workers",
+    "task",
+    "work",
+    "area",
+    "during",
+    "per",
+    "minute",
+    "minutes",
+    "hour",
+    "hours",
+    "shift",
+    "lifts",
+    "lift",
+    "load",
+    "object",
+    "objects",
+    "operator",
+    "operators",
+    "environment",
+    "floor",
+    "level",
+    "storage",
+    "for",
+    "each",
+    "performs",
+    "performed",
+}
+
+
+def _extract_significant_tokens(text: str) -> Tuple[Set[str], Set[str]]:
+    """Extract significant word and numeric tokens for style guard checks."""
+
+    if not text:
+        return set(), set()
+
+    words = set()
+    numbers = set()
+
+    for raw in re.findall(r"[A-Za-z0-9\.]+", text):
+        cleaned = raw.strip()
+        if not cleaned:
+            continue
+
+        if any(char.isdigit() for char in cleaned):
+            numbers.add(_normalize_numeric_token(cleaned))
+            continue
+
+        lowered = cleaned.lower()
+        if len(lowered) < 4:
+            continue
+        if lowered in _STYLE_STOPWORDS:
+            continue
+
+        words.add(lowered)
+
+    return words, numbers
+
+
+def _edited_body_is_inconsistent(original_body: str, edited_body: str) -> bool:
+    """Return True when edited text loses critical terminology or numbers."""
+
+    if not original_body:
+        return False
+
+    orig_words, orig_numbers = _extract_significant_tokens(original_body)
+    if not orig_words and not orig_numbers:
+        return False
+
+    edited_words, edited_numbers = _extract_significant_tokens(edited_body)
+
+    if orig_numbers and not orig_numbers.issubset(edited_numbers):
+        return True
+
+    if orig_words:
+        overlap = orig_words & edited_words
+        if len(orig_words) >= 3:
+            if len(overlap) / len(orig_words) < 0.5:
+                return True
+        elif overlap != orig_words:
+            return True
+
+    return False
 
 
 def apply_redesign_linguistic_filtering(text: str) -> str:
@@ -2020,7 +2132,13 @@ TASK: Edit the body to NIOSH manual style while keeping the header unchanged. Re
             section_summary = json.dumps(section_summary, ensure_ascii=False)
 
         edited_body = (edited_body or "").strip()
-        section_summary = fallback_summary(section_summary)
+
+        if _edited_body_is_inconsistent(body, edited_body):
+            print("       [!] Edited body lost scenario-specific details, reverting to original")
+            edited_body = body.strip()
+            section_summary = fallback_summary(body)
+        else:
+            section_summary = fallback_summary(section_summary)
 
         if header:
             if edited_body:
