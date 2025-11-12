@@ -1861,57 +1861,190 @@ The weight to be lifted ({L_lb}) {'exceeds' if li_origin_val > 1.0 else 'is with
 # --- Technical Style and Tone Correction ---
 
 def correct_technical_style_tone(report_text, calculated_data):
-    """
-    Use LLM to correct technical style and tone to match NIOSH manual standards.
-    Returns corrected report with neutral, didactic technical language.
-    """
-    
-    style_prompt = f"""
-You are a NIOSH technical editor specializing in the "Applications Manual for the Revised NIOSH Lifting Equation".
+    """Apply section-by-section NIOSH style correction using isolated LLM chats."""
 
-Your task is to edit the following report text to match the exact style and tone of the official NIOSH manual.
-
-NIOSH STYLE REQUIREMENTS:
-1. **Neutral Technical Language**: Use objective, didactic language (no "you should", "must", "recommend")
-2. **Non-Prescriptive Formulations**: 
-   - Instead of "You should reduce the frequency" → "Reducing the lifting frequency may increase the FM value"
-   - Instead of "Workers must avoid twisting" → "Eliminating trunk twisting may increase the AM value"
-3. **Professional Terminology**: Use precise ergonomic and biomechanical terms
-4. **Didactic Tone**: Educational and explanatory, not instructional or promotional
-5. **Quantitative Focus**: Emphasize numerical relationships and calculations
-6. **No Personal Voice**: Remove first-person and direct address to reader
-
-EDITING RULES:
-- Replace prescriptive language with neutral technical descriptions
-- Use "may", "can", "would" instead of "should", "must", "need to"
-- Focus on technical relationships between variables
-- Maintain all numerical values, calculations, and technical data
-- Keep the NIOSH section structure unchanged
-- Preserve all technical accuracy
-
-CURRENT REPORT TO EDIT:
-{report_text}
-
-Return ONLY the corrected report text with improved NIOSH style. Do not add explanations or summaries.
-"""
-    
-    try:
-        print("   Applying NIOSH style corrections...")
-        corrected_text = call_ollama(
-            "You are a NIOSH technical editor. Edit the text to match official NIOSH manual style.",
-            style_prompt
-        )
-        
-        if corrected_text and len(corrected_text) > len(report_text) * 0.8:  # Reasonable length check
-            print("   [+] Style corrections applied successfully")
-            return corrected_text.strip()
-        else:
-            print("   [!] Style correction returned insufficient text, using original")
-            return report_text
-            
-    except Exception as e:
-        print(f"   [X] Style correction failed: {e}")
+    if not report_text:
         return report_text
+
+    def split_report_sections(text):
+        """Split report into ordered sections while preserving headers."""
+
+        lines = text.splitlines()
+        index = 0
+        title_header = None
+        sections = []
+
+        if lines and lines[0].startswith("# "):
+            title_header = lines[0].strip()
+            index = 1
+
+        intro_lines = []
+        while index < len(lines) and not lines[index].startswith("## "):
+            intro_lines.append(lines[index])
+            index += 1
+
+        if title_header or any(line.strip() for line in intro_lines):
+            sections.append({
+                "header": title_header,
+                "body": "\n".join(intro_lines).strip()
+            })
+
+        current_header = None
+        current_lines = []
+
+        while index < len(lines):
+            line = lines[index]
+            if line.startswith("## "):
+                if current_header is not None:
+                    sections.append({
+                        "header": current_header,
+                        "body": "\n".join(current_lines).strip()
+                    })
+                current_header = line.strip()
+                current_lines = []
+            else:
+                current_lines.append(line)
+            index += 1
+
+        if current_header is not None:
+            sections.append({
+                "header": current_header,
+                "body": "\n".join(current_lines).strip()
+            })
+
+        return sections
+
+    def fallback_summary(text):
+        """Generate lightweight summary fallback from section body."""
+
+        if not text:
+            return ""
+
+        cleaned = text.strip()
+        if not cleaned:
+            return ""
+
+        sentences = re.split(r'(?<=[.!?])\s+', cleaned)
+        for sentence in sentences:
+            if sentence.strip():
+                return sentence.strip()[:250]
+
+        return cleaned[:250]
+
+    sections = split_report_sections(report_text)
+
+    if not sections:
+        return report_text
+
+    system_prompt = """You are a NIOSH technical editor for the "Applications Manual for the Revised NIOSH Lifting Equation".
+
+You will receive one report section at a time. Edit the body text to match the exact manual style while keeping the section
+header unchanged.
+
+STRICT RULES:
+- Preserve every numerical value, unit, and equation exactly as provided.
+- Maintain Markdown formatting, bullet structure, and equation layout.
+- Remove prescriptive or conversational phrasing and replace with neutral technical language.
+- Do NOT copy text from other sections; rely only on the supplied content and summary.
+- The section summary is ONLY for context continuity and must NOT appear in the edited body.
+
+Respond ONLY with valid JSON in the form:
+{
+  "body": "edited section body without the header",
+  "section_summary": "single concise sentence (max 2) summarising the key facts"
+}
+"""
+
+    previous_summary = ""
+    edited_sections = []
+    section_summaries = []
+
+    print("   Applying NIOSH style corrections section-by-section...")
+
+    for idx, section in enumerate(sections, 1):
+        header = section.get("header")
+        body = section.get("body", "")
+        section_label = header if header else "Document Introduction"
+
+        print(f"     • Section {idx}/{len(sections)}: {section_label}")
+
+        body_for_prompt = body if body.strip() else "[EMPTY]"
+        summary_for_prompt = previous_summary if previous_summary else "None"
+
+        user_prompt = f"""SECTION HEADER:
+{section_label}
+
+ORIGINAL BODY:
+{body_for_prompt}
+
+PREVIOUS SECTION SUMMARY (for context only, do NOT repeat):
+{summary_for_prompt}
+
+TASK: Edit the body to NIOSH manual style while keeping the header unchanged. Return JSON with keys 'body' and 'section_summary'.
+"""
+
+        edited_body = body
+        section_summary = fallback_summary(body)
+
+        try:
+            response = call_ollama(
+                "You are a NIOSH technical editor. Return only JSON as specified.",
+                user_prompt,
+                json_response=True,
+                timeout=45
+            )
+
+            if response:
+                parsed_response = json.loads(repair_json(response))
+
+                if isinstance(parsed_response, list):
+                    parsed_response = next(
+                        (item for item in parsed_response if isinstance(item, dict)),
+                        None,
+                    )
+
+                if isinstance(parsed_response, dict):
+                    edited_body = parsed_response.get("body", body)
+                    section_summary = parsed_response.get("section_summary", section_summary)
+                else:
+                    print("       [!] Unexpected response format, using fallback body")
+            else:
+                print("       [!] Empty response from style correction, keeping original body")
+        except Exception as e:
+            print(f"       [!] Style correction failed for section: {e}")
+
+        if not isinstance(edited_body, str):
+            edited_body = json.dumps(edited_body, ensure_ascii=False)
+
+        if not isinstance(section_summary, str):
+            section_summary = json.dumps(section_summary, ensure_ascii=False)
+
+        edited_body = (edited_body or "").strip()
+        section_summary = fallback_summary(section_summary)
+
+        if header:
+            if edited_body:
+                edited_sections.append(f"{header}\n\n{edited_body}")
+            else:
+                edited_sections.append(header)
+        else:
+            edited_sections.append(edited_body)
+
+        previous_summary = section_summary
+        section_summaries.append({
+            "header": header or "Document Introduction",
+            "summary": section_summary
+        })
+
+    if isinstance(calculated_data, dict):
+        processing_meta = calculated_data.setdefault("processing_metadata", {})
+        processing_meta["style_section_summaries"] = section_summaries
+
+    final_report = "\n\n".join(part.strip() for part in edited_sections if part.strip()).strip()
+
+    print("   [+] Section-by-section style corrections completed")
+
+    return final_report
 
 def validate_niosh_compliance_style(report_text):
     """
