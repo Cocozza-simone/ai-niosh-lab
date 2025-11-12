@@ -48,6 +48,8 @@ import random
 import requests
 import copy
 import re
+from decimal import Decimal, InvalidOperation
+from typing import Set, Tuple
 from pathlib import Path
 from datetime import datetime
 from niosh_calculator_v2 import calculate_niosh_v2
@@ -192,7 +194,7 @@ def clean_narrative_language(text: str) -> str:
 def apply_comprehensive_niosh_linguistic_filtering(report_text: str) -> str:
     """
     Apply comprehensive linguistic filtering to entire NIOSH report.
-    
+
     This function processes the complete report to ensure it conforms
     to NIOSH manual writing standards with assertive, direct language.
     """
@@ -235,6 +237,116 @@ def apply_comprehensive_niosh_linguistic_filtering(report_text: str) -> str:
     
     print("Linguistic filtering completed")
     return filtered_report
+
+
+def _normalize_numeric_token(token: str) -> str:
+    """Normalize numeric strings so comparisons remain stable."""
+
+    try:
+        value = Decimal(token)
+    except (InvalidOperation, TypeError):
+        return token.strip()
+
+    if value == value.to_integral():
+        return str(int(value))
+
+    normalized = format(value.normalize(), 'f')
+    return normalized.rstrip('0').rstrip('.') if '.' in normalized else normalized
+
+
+_STYLE_STOPWORDS = {
+    "the",
+    "and",
+    "with",
+    "from",
+    "that",
+    "this",
+    "into",
+    "onto",
+    "over",
+    "worker",
+    "workers",
+    "task",
+    "work",
+    "area",
+    "during",
+    "per",
+    "minute",
+    "minutes",
+    "hour",
+    "hours",
+    "shift",
+    "lifts",
+    "lift",
+    "load",
+    "object",
+    "objects",
+    "operator",
+    "operators",
+    "environment",
+    "floor",
+    "level",
+    "storage",
+    "for",
+    "each",
+    "performs",
+    "performed",
+}
+
+
+def _extract_significant_tokens(text: str) -> Tuple[Set[str], Set[str]]:
+    """Extract significant word and numeric tokens for style guard checks."""
+
+    if not text:
+        return set(), set()
+
+    words = set()
+    numbers = set()
+
+    for raw in re.findall(r"[A-Za-z0-9\.]+", text):
+        cleaned = raw.strip()
+        if not cleaned:
+            continue
+
+        if any(char.isdigit() for char in cleaned):
+            numbers.add(_normalize_numeric_token(cleaned))
+            continue
+
+        lowered = cleaned.lower()
+        if len(lowered) < 4:
+            continue
+        if lowered in _STYLE_STOPWORDS:
+            continue
+
+        words.add(lowered)
+
+    return words, numbers
+
+
+def _edited_body_is_inconsistent(original_body: str, edited_body: str) -> bool:
+    """Return True when edited text loses critical terminology or numbers."""
+
+    if not original_body:
+        return False
+
+    orig_words, orig_numbers = _extract_significant_tokens(original_body)
+    if not orig_words and not orig_numbers:
+        return False
+
+    edited_words, edited_numbers = _extract_significant_tokens(edited_body)
+
+    if orig_numbers and not orig_numbers.issubset(edited_numbers):
+        return True
+
+    if orig_words:
+        overlap = orig_words & edited_words
+        if len(orig_words) >= 3:
+            if len(overlap) / len(orig_words) < 0.5:
+                return True
+        elif overlap != orig_words:
+            return True
+
+    return False
 
 
 def apply_redesign_linguistic_filtering(text: str) -> str:
@@ -285,29 +397,68 @@ def apply_final_linguistic_cleanup(text: str) -> str:
     """
     Apply final cleanup to ensure NIOSH manual style compliance.
     """
+
+    def _replace_inline_json_lists(match):
+        candidate = match.group(0)
+
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            return candidate
+
+        if not isinstance(parsed, list):
+            return candidate
+
+        normalized_lines = []
+
+        for item in parsed:
+            if not isinstance(item, str):
+                return candidate
+
+            line = item.strip()
+            if not line:
+                continue
+
+            # Only convert enumerated redesign sentences (e.g., "1. ...")
+            if not re.match(r'^\d+\.\s', line):
+                return candidate
+
+            if not line.endswith("  "):
+                line = f"{line}  "
+
+            normalized_lines.append(line)
+
+        return "\n".join(normalized_lines)
+
+    text = re.sub(r'\[(?:\s*"[^"]*"\s*,?)+\s*\]', _replace_inline_json_lists, text)
+
     # Final pattern replacements for entire report
     final_patterns = [
+        # Remove any remaining leading prompt residue like [[...]]
+        (r'^\s*\[\[.*?\]\]\s*', '', re.DOTALL),
+
         # Remove any remaining "Alternative Solutions" references
         (r'##?\s*Alternative\s+Solutions.*?(?=\n##|\n\n|$)', '', re.DOTALL),
         (r'Alternative\s+Solutions.*?(?=\n##|\n\n|$)', '', re.DOTALL),
-        
-        # Fix specific NIOSH manual requirements from 
+
+        # Fix specific NIOSH manual requirements from
         (r'If the FM value were optimized', 'Increasing FM increases RWL and reduces LI proportionally'),
-        
-        # Remove duplicate headers
+
+        # Remove duplicate headers and redundant Comments blocks
         (r'##\s*Redesign\s+Suggestions\s+Suggestions', '## Redesign Suggestions'),
-        
+        (r'(##\s*Comments)(?:\s*\n\s*##\s*Comments)+', r'\1'),
+
         # Clean up extra whitespace
         (r'\n{3,}', '\n\n'),
         (r'^\s+|\s+$', ''),
     ]
-    
+
     for pattern in final_patterns:
         if isinstance(pattern, tuple):
             text = re.sub(pattern[0], pattern[1], text, flags=pattern[2] if len(pattern) > 2 else 0)
         else:
             text = re.sub(pattern, '', text)
-    
+
     return text.strip()
 
 # LLM Configuration
@@ -1084,60 +1235,59 @@ def _get_table8_recommendation(factor):
 
 def generate_comments_section(calc, params, li_origin_val):
     """Generate comments section following exact NIOSH PDF format."""
-    
-    report = """
-## Comments
 
-"""
-    
-    # Duration observations
-    duration = params["common_parameters"]["duration_hours"]
+    duration = params["common_parameters"].get("duration_hours", 0)
     pattern = calc.get("work_pattern", "continuous")
-    
-    if pattern == "continuous" and duration >= 1:
-        report += f"""This analysis was based on a {duration}-hour work session. """
-        
-        if duration > 1:
-            report += """If a subsequent work session begins before the appropriate recovery period has elapsed, then the longer duration category was used to compute the FM value.
-"""
-        else:
-            report += """If a subsequent work session begins before the appropriate recovery period has elapsed, then the two-hour category should be used to compute the FM value. In this example, the lifting pattern is continuous during the entire session; therefore, the lifting frequency is not adjusted using the special procedure described in the Frequency Component section.
-
-"""
-        
-        report += """
-
-"""
-    
-        
-    # Asymmetry observations if AM is limiting
-    limiting = calc["calculation_results"]["limiting_factors"][0]
-    factor_name = limiting["factor"].split("_")[0]
-    
-    if factor_name == "AM":
-        report += """Although several alternate redesign suggestions are provided, reducing the asymmetry angle should be given a high priority because a significant number of overexertion lifting injuries are associated with excessive lumbar rotation and flexion.
-
-"""
-    
-    # Significant control observations
     sig_control = params.get("significant_control_at_destination", False)
+
+    duration_labels = {
+        0.3: "twenty-minute",
+        0.5: "half-hour",
+        1.0: "one-hour",
+        2.0: "two-hour",
+        4.0: "four-hour",
+        8.0: "eight-hour",
+    }
+
+    rounded_duration = round(duration, 1)
+    duration_label = duration_labels.get(rounded_duration, f"{rounded_duration:.1f}-hour")
+
+    sentences = [
+        f"This analysis was based on a {rounded_duration:.1f}-hour work session.",
+        f"The {duration_label} category was used to compute the FM value.",
+    ]
+
+    if pattern == "continuous":
+        sentences.append(
+            "The lifting pattern is continuous during the entire session; therefore, the lifting frequency is not adjusted using the special procedure described in the Frequency Component section."
+        )
+
     if sig_control:
-        report += """This analysis assumes that significant control is required at the destination of the lift.
+        sentences.append("This analysis assumes that significant control is required at the destination of the lift.")
+    else:
+        sentences.append("This analysis assumes that significant control is not required at the destination of the lift.")
 
-"""
-    
-    # FM note if present
-    if calc.get('fm_note'):
-        report += f"""{calc['fm_note']}
+    fm_note = calc.get("fm_note")
+    fm_sentence = None
+    if fm_note:
+        cleaned_note = fm_note.strip()
+        if cleaned_note:
+            if not cleaned_note.endswith('.'):
+                cleaned_note = f"{cleaned_note}."
+            fm_sentence = cleaned_note
 
-"""
-    
-    # Add standard closing statement per 
-    report += """This example illustrates that large horizontal reach and low origin height significantly reduce the recommended weight limit.
+    closing_sentence = (
+        "This example illustrates that large horizontal reach and low origin height substantially reduce the recommended weight limit."
+    )
 
-"""
-    
-    return report
+    report_lines = ["## Comments", "", " ".join(sentences)]
+
+    if fm_sentence:
+        report_lines.append(fm_sentence)
+
+    report_lines.append(closing_sentence)
+
+    return "\n".join(report_lines) + "\n"
 
 # --- Unit Conversion Functions for NIOSH Standard Units ---
 
@@ -1996,6 +2146,13 @@ TASK: Edit the body to NIOSH manual style while keeping the header unchanged. Re
 
             if response:
                 parsed_response = json.loads(repair_json(response))
+
+                if isinstance(parsed_response, list):
+                    parsed_response = next(
+                        (item for item in parsed_response if isinstance(item, dict)),
+                        None,
+                    )
+
                 if isinstance(parsed_response, dict):
                     edited_body = parsed_response.get("body", body)
                     section_summary = parsed_response.get("section_summary", section_summary)
@@ -2006,8 +2163,20 @@ TASK: Edit the body to NIOSH manual style while keeping the header unchanged. Re
         except Exception as e:
             print(f"       [!] Style correction failed for section: {e}")
 
+        if not isinstance(edited_body, str):
+            edited_body = json.dumps(edited_body, ensure_ascii=False)
+
+        if not isinstance(section_summary, str):
+            section_summary = json.dumps(section_summary, ensure_ascii=False)
+
         edited_body = (edited_body or "").strip()
-        section_summary = fallback_summary(section_summary)
+
+        if _edited_body_is_inconsistent(body, edited_body):
+            print("       [!] Edited body lost scenario-specific details, reverting to original")
+            edited_body = body.strip()
+            section_summary = fallback_summary(body)
+        else:
+            section_summary = fallback_summary(section_summary)
 
         if header:
             if edited_body:
@@ -2402,7 +2571,7 @@ The trays normally weigh {L_lb}. Using Table 6, the coupling is classified as {p
     if sig_control:
         report += f""" The coupling at the destination is {params['destination_parameters']['C_dest_type']}."""
     
-    report += f""" The lifting frequency is {params['common_parameters']['F_frequency_per_min']:.2f} lifts/minute over a {params['common_parameters']['duration_hours']}-hour work session ({calc['calculation_results']['work_pattern']}). 
+    report += f""" The lifting frequency is {params['common_parameters']['F_frequency_per_min']:.2f} lifts/minute over a {params['common_parameters']['duration_hours']}-hour work session ({calc['calculation_results']['work_pattern']}).
 
 *Note: This analysis uses the original NIOSH imperial units (inches and pounds) as specified in the Applications Manual for the Revised NIOSH Lifting Equation.*
 
@@ -2410,12 +2579,28 @@ The trays normally weigh {L_lb}. Using Table 6, the coupling is classified as {p
 **RWL = LC × HM × VM × DM × AM × FM × CM**
 
 Where LC (Load Constant) = 51 lb for ideal conditions.
+"""
 
+    origin_rwl_text = format_niosh_rwl(calc['calculation_results']['origin']['RWL'])
+    destination_rwl = None
+    if sig_control and calc['calculation_results'].get('destination'):
+        destination_rwl = format_niosh_rwl(calc['calculation_results']['destination']['RWL'])
+
+    if destination_rwl:
+        figure_sentence = (
+            f"As shown in Figure 14, the RWL for this activity is {origin_rwl_text} at the origin; as shown in Figure 15, the RWL at the destination is {destination_rwl}."
+        )
+    else:
+        figure_sentence = f"As shown in Figure 14, the RWL for this activity is {origin_rwl_text} at the origin."
+
+    report += f"""
 The multipliers were determined from the appropriate tables as follows: HM = {calc['calculation_results']['origin']['HM']:.2f}, VM = {calc['calculation_results']['origin']['VM']:.2f}, DM = {calc['calculation_results']['origin']['DM']:.2f}, AM = {calc['calculation_results']['origin']['AM']:.2f}, FM = {calc['calculation_results']['origin']['FM']:.2f}, and CM = {calc['calculation_results']['origin']['CM']:.2f}.
 
-The RWL for this activity is **{format_niosh_rwl(calc['calculation_results']['origin']['RWL'])}** at the origin.
+The RWL for this activity is **{origin_rwl_text}** at the origin.
 
-Lifting Index (LI) = L/RWL = {L_lb}/{format_niosh_rwl(calc['calculation_results']['origin']['RWL'])} = **{format_li_with_descriptor(calc['calculation_results']['origin']['LI'])}**
+{figure_sentence}
+
+Lifting Index (LI) = L/RWL = {L_lb}/{origin_rwl_text} = **{format_li_with_descriptor(calc['calculation_results']['origin']['LI'])}**
 """
 
     # Add DM note and descriptive note for extreme values
