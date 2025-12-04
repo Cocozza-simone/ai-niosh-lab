@@ -183,6 +183,68 @@ class NIOSHExampleGenerator:
                 return all_combinations[:max_combinations]
             return all_combinations
 
+    def _create_prompt(self, combination):
+        """
+        Crea il prompt per la generazione dello scenario.
+        Shared method for both sync and async calls.
+        """
+        return f"""You are a deterministic generator of ergonomic lifting scenarios.
+
+Your task is to produce ONE sentence for each input combination:
+Generate one sentence using: {json.dumps(combination, ensure_ascii=False)}
+
+You MUST select RANDOMLY one of the three scenario types:
+• SINGLE TASK
+• REPETITIVE SINGLE TASK
+• MULTI-TASK SEQUENCE
+
+The selection of the type MUST be random and MUST NOT depend on the content of the input combination.
+
+----------------------------------------------------------
+SENTENCE RULES (MANDATORY)
+----------------------------------------------------------
+• Output ONLY the sentence. No comments, no explanations, no formatting.
+• Use clear, natural English.
+• Maximum length: 330 characters.
+• Follow the structure: subject + action + location + object.
+• Do NOT include any numbers, dimensions, durations, or weights.
+• Use generic wording for objects (e.g., “boxes”, “racks”, “containers”).
+• No commas unless needed to join actions in a multi-task sentence.
+
+----------------------------------------------------------
+SCENARIO TYPES (YOU MUST RANDOMLY PICK ONE)
+----------------------------------------------------------
+
+1. SINGLE TASK
+   - Exactly one action in one place on one object.
+   - Example pattern:
+     “The worker lifts boxes from a pallet in the loading area.”
+
+2. REPETITIVE SINGLE TASK
+   - One action repeated.
+   - Use words such as:
+     “repeatedly”, “continuously”, “throughout the shift”.
+   - Example pattern:
+     “The worker repeatedly lifts trays at the packing station.”
+
+3. MULTI-TASK SEQUENCE
+   - More than one distinct action joined in a single sentence.
+   - Use connectors:
+     “then”, “and next”, “followed by”.
+   - Example pattern:
+     “The worker lifts bins from the floor then places crates on a shelf.”
+
+----------------------------------------------------------
+RULE ENFORCEMENT
+----------------------------------------------------------
+• Randomly choose the scenario type BEFORE generating the sentence.
+• Never invent numbers, weights, measurements, or durations.
+• Never break the single-sentence rule.
+• Never exceed 330 characters.
+• Output ONLY the sentence.
+
+"""
+
     async def generate_scenario_with_ollama_async(self, session, combination):
         """
         Versione asincrona: genera uno scenario NIOSH usando Ollama con llama3.2
@@ -194,7 +256,7 @@ class NIOSHExampleGenerator:
 
         payload = {
             "model": "niosh_scenario_model",  # il nome definito nel Modelfile
-            "prompt": json.dumps(combination, ensure_ascii=False),
+            "prompt": self._create_prompt(combination),
             "stream": False,
             "temperature": 0.7,
             "num_predict": 150,
@@ -310,69 +372,14 @@ class NIOSHExampleGenerator:
             combination: Dizionario con la combinazione di valori
         """
         # Crea il prompt per generare lo scenario
-        prompt = f"""You are a deterministic generator of ergonomic lifting scenarios.
-
-Your task is to produce ONE sentence for each input combination:
-Generate one sentence using: {json.dumps(combination, ensure_ascii=False)}
-
-You MUST select RANDOMLY one of the three scenario types:
-• SINGLE TASK
-• REPETITIVE SINGLE TASK
-• MULTI-TASK SEQUENCE
-
-The selection of the type MUST be random and MUST NOT depend on the content of the input combination.
-
-----------------------------------------------------------
-SENTENCE RULES (MANDATORY)
-----------------------------------------------------------
-• Output ONLY the sentence. No comments, no explanations, no formatting.
-• Use clear, natural English.
-• Maximum length: 330 characters.
-• Follow the structure: subject + action + location + object.
-• Do NOT include any numbers, dimensions, durations, or weights.
-• Use generic wording for objects (e.g., “boxes”, “racks”, “containers”).
-• No commas unless needed to join actions in a multi-task sentence.
-
-----------------------------------------------------------
-SCENARIO TYPES (YOU MUST RANDOMLY PICK ONE)
-----------------------------------------------------------
-
-1. SINGLE TASK
-   - Exactly one action in one place on one object.
-   - Example pattern:
-     “The worker lifts boxes from a pallet in the loading area.”
-
-2. REPETITIVE SINGLE TASK
-   - One action repeated.
-   - Use words such as:
-     “repeatedly”, “continuously”, “throughout the shift”.
-   - Example pattern:
-     “The worker repeatedly lifts trays at the packing station.”
-
-3. MULTI-TASK SEQUENCE
-   - More than one distinct action joined in a single sentence.
-   - Use connectors:
-     “then”, “and next”, “followed by”.
-   - Example pattern:
-     “The worker lifts bins from the floor then places crates on a shelf.”
-
-----------------------------------------------------------
-RULE ENFORCEMENT
-----------------------------------------------------------
-• Randomly choose the scenario type BEFORE generating the sentence.
-• Never invent numbers, weights, measurements, or durations.
-• Never break the single-sentence rule.
-• Never exceed 330 characters.
-• Output ONLY the sentence.
-
-"""
+        prompt = self._create_prompt(combination)
 
         try:
             response = requests.post(
                 f"{self.ollama_url}/api/generate",
                 json={
                     "model": "niosh_scenario_model",  # il nome definito nel Modelfile
-                    "prompt": json.dumps(combination, ensure_ascii=False),
+                    "prompt": prompt,
                     "stream": False,
                     "temperature": 0.7,
                     "num_predict": 60,
