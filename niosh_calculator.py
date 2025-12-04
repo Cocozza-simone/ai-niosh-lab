@@ -483,31 +483,38 @@ class NIOSHCalculator:
     def _hm(self, H: float) -> float:
         """
         Horizontal Multiplier.
-        Formula NIOSH corretta: HM = 10 / H (H in inches, 10 ≤ H ≤ 63).
+        Formula NIOSH corretta: HM = 10 / H (H in inches, 10 ≤ H ≤ 25).
         Per H < 10, HM = 1.0 (alcune interpretazioni usano H/10, ma NIOSH usa 10/H)
+        Per H > 25, HM = 0.0.
         """
         if H <= 0:
+            return 0.0
+
+        if H > 25.0:
             return 0.0
 
         if H < 10.0:
             H_clamped = 10.0
         else:
-            H_clamped = min(max(H, 10.0), 25.0)
+            H_clamped = H
         return 10.0 / H_clamped
 
     def _vm(self, V: float) -> float:
         """
         Vertical Multiplier.
         Formula NIOSH corretta: VM = 1 - 0.003 * |V - 30|, con V in inches (0–70).
-        Valore massimo: 1.0 (quando V = 30"), minimo: 0.0 (estremi)
+        Valore massimo: 1.0 (quando V = 30"), minimo: 0.0 (estremi).
+        Se V > 70, VM = 0.0.
 
         NOTA: Il coefficiente 0.003 è quello specificato nel Revised NIOSH Lifting Equation.
         """
-        if V <= 0:
+        if V < 0:
             return 0.0
 
-        V_clamped = max(0.0, min(V, 70.0))
-        vm = 1.0 - 0.003 * abs(V_clamped - 30.0)
+        if V > 70.0:
+            return 0.0
+
+        vm = 1.0 - 0.003 * abs(V - 30.0)
         # NIOSH specifica che VM non può essere negativo
         return max(vm, 0.0)
 
@@ -515,7 +522,11 @@ class NIOSHCalculator:
         """
         Distance Multiplier.
         Formula standard: DM = 0.82 + 1.8 / D, con D in inches (10–70), troncato a ≤ 1.
+        Se D > 70, DM = 0.0.
         """
+        if D > 70.0:
+            return 0.0
+
         D_clamped = max(10.0, min(D, 70.0))
         dm = 0.82 + 1.8 / D_clamped
         return min(dm, 1.0)
