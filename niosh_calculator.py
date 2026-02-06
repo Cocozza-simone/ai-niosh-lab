@@ -12,6 +12,7 @@ Nota importante:
   riproduzione letterale delle tabelle NIOSH, ma è coerente come ordine di grandezza).
 """
 
+import math
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional, Tuple, List, Iterable, Any
 from niosh_parameters import NIOSHParameters
@@ -210,6 +211,9 @@ class MultiTaskCalculationResult:
         if not valid_tasks:
             self.cli = 0.0
             return
+        if any(not math.isfinite(t.stli) for t in valid_tasks):
+            self.cli = float("inf")
+            return
 
         # Assicuriamoci che i task siano ordinati per STLI decrescente
         tasks_sorted = sorted(valid_tasks, key=lambda t: t.stli, reverse=True)
@@ -230,7 +234,8 @@ class MultiTaskCalculationResult:
         for i, task in enumerate(tasks_sorted[1:], 1):  # Salta il primo task
             # Aggiungi solo se STLI > 1.0 (contributo significativo)
             if task.stli > 1.0:
-                cli_sum += task.stli * decrement_factor
+                task_decrement = 0.6 if task.significant_control else 0.8
+                cli_sum += task.stli * task_decrement
                 # Il fattore di decremento potrebbe diminuire per task successivi
                 # Per ora manteniamo costante per semplicità
 
@@ -252,7 +257,11 @@ class MultiTaskCalculationResult:
 
     def reorder_tasks_by_stress(self):
         """Riordina i task per stress decrescente (STLI)"""
-        self.tasks_by_stress = sorted(self.tasks, key=lambda t: t.stli, reverse=True)
+        self.tasks_by_stress = sorted(
+            self.tasks,
+            key=lambda t: t.stli if t.stli is not None else -math.inf,
+            reverse=True,
+        )
 
     def as_dict(self) -> Dict:
         """
