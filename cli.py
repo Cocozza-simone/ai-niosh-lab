@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import List
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from gemini_judge import GeminiJudge, JudgeInput
 from validators import intelligent_llm_prevalidator, validate_params
 
 from job_description_generator import NIOSHJobDescriptionGenerator
@@ -26,7 +26,7 @@ from consistency_checks import ensure_job_consistency
 from tag_extractor import extract_tagged_params, remove_tags
 from multi_task_extractor import extract_multi_task_tags
 from model_router import call_llm_with_system_prompt
-
+from task_classifier import classify_sentence
 from rich_utils import (
     console,
     create_niosh_results_table,
@@ -47,7 +47,8 @@ from rich_utils import (
     show_save_confirmation,
 )
 
-LLM_SEMAPHORE = threading.Semaphore(2)
+judge = GeminiJudge()
+
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -67,36 +68,6 @@ if sys.platform == "win32" and hasattr(sys, "excepthook"):
     sys.excepthook = simple_excepthook
 
 
-def classify_sentence(text: str, model="llama3.2") -> str:
-    system = """
-You are an expert in ergonomic task analysis and the Revised NIOSH Lifting Equation.
-
-Classify the following lifting scenario into ONLY ONE category:
-
-- multi
-- repetitive
-- single
-
-Output ONLY one word.
-    """
-
-    with LLM_SEMAPHORE:
-        response = (
-            call_llm_with_system_prompt(
-                model=model,
-                system_prompt=system,
-                user_prompt=f"Scenario: {text}",
-                temperature=0.0,
-            )
-            .strip()
-            .lower()
-        )
-
-    if "multi" in response:
-        return "multi"
-    if "repetitive" in response:
-        return "repetitive"
-    return "single"
 
 
 def map_extractor_to_calculator(tasks_data_raw: List[dict]) -> List[dict]:
@@ -151,13 +122,13 @@ def batch_process_file(
     input_file: str,
     output_dir: str = "batch_reports",
     model: str = "gemma3:12b",
-    max_workers: int = 8,  # ← puoi alzarlo a 6–8 se hai CPU/GPU buona
+    max_workers: int = 8,
 ):
     """
-    Versione ottimizzata di batch_process_file:
-    - Classificazione tramite LLM (single / repetitive / multi)
-    - Parallel processing tramite ThreadPoolExecutor
-    - Prompt caching attivo (richiede patch in model_router)
+    Versione DEFINITIVA con:
+    - JD specific/combined per single/repetitive/multi
+    - JA/HA/RS specific/combined anche per multi-task
+    - JSON strutturato per analisi successive
     """
 
     Path(output_dir).mkdir(exist_ok=True)
@@ -174,162 +145,371 @@ def batch_process_file(
     def process_single_scenario(idx: int, text: str):
         print(f"[Worker] Processing scenario {idx}: {text}")
 
-        # 1) Classificazione LLM
-        task_type = classify_sentence(text)
-        is_multi = task_type == "multi"
+        try:
+            # -------------------------------------------------------
+            # 1) CLASSIFICAZIONE LLM (single / repetitive / multi)
+            # -------------------------------------------------------
+            task_type = classify_sentence(text)
+            is_multi = task_type == "multi"
 
-        # 2) Job description (LLM)
-        with LLM_SEMAPHORE:
-            result = jd_gen.analyze_job(text,task_type)
-            jd_text = result["description"]
-            params = result["parameters"]
+            # -------------------------------------------------------
+            # 2) JOB DESCRIPTION via PIPELINE NIOSH
+            # -------------------------------------------------------
+            result = jd_gen.analyze_job(text, task_type)
 
-        # ➜ FIX: rimuoviamo i TAG dalla Job Description appena generata
-        jd_text_clean = remove_tags(jd_text)
-
-        # 3) SINGLE-TASK ============================================
-        if not is_multi:
-            params_raw = extract_tagged_params(jd_text)
-
-            with LLM_SEMAPHORE:
-                params_full = intelligent_llm_prevalidator(params_raw, jd_text)
-
-            params = NIOSHParameters(**params_full)
-
-            calc_result = calc.compute(params)
-
-            # Job Analysis (pulito)
-            with LLM_SEMAPHORE:
-                ja_text = remove_tags(ja_gen.generate_job_analysis(params,task_type))
-
-            # Hazard assessment
-            hz_input = HazardAssessmentInput(
-                task_description=jd_text_clean,  # <-- JD SENZA TAG
-                weight_lbs=params.weight,
-                rwl_origin_lbs=calc_result.rwl_origin_lbs,
-                rwl_dest_lbs=calc_result.rwl_destination_lbs,
-                li_origin=calc_result.li_origin,
-                li_dest=calc_result.li_destination,
-                significant_control=params.significant_control,
+            jd_text = (
+                result.get("description_with_tags")
+                or result.get("job_description_with_tags")
+                or result.get("description")
             )
-            with LLM_SEMAPHORE:
-                ha_text = remove_tags(hz_gen.generate_hazard_assessment(hz_input,task_type))
+            if not jd_text:
+                print(f"[ERROR] Job analysis failed for scenario {idx}: missing description")
+                return idx, None, None
 
-            # Redesign suggestions
-            rs_input = RedesignSuggestionsInput(
-                task_description=jd_text_clean,  # <-- JD SENZA TAG
-                h_origin=params.horizontal_origin,
-                h_dest=params.horizontal_destination,
-                v_origin=params.vertical_origin,
-                v_dest=params.vertical_destination,
-                a_origin=params.asymmetry_angle,
-                a_dest=params.asymmetry_angle,
-                frequency_lifts_per_min=params.frequency,
-                duration_class=params.duration,
-                coupling=params.coupling,
-                significant_control=params.significant_control,
-                weight_lbs=params.weight,
-                rwl_origin_lbs=calc_result.rwl_origin_lbs,
-                rwl_dest_lbs=calc_result.rwl_destination_lbs,
-                li_origin=calc_result.li_origin,
-                li_dest=calc_result.li_destination,
-                multipliers_origin=calc_result.multipliers_origin,
-                multipliers_destination=calc_result.multipliers_destination,
-                risk_category=calc_result.risk_category,
-                risk_comment=calc_result.risk_comment,
-            )
-            with LLM_SEMAPHORE:
-                rs_text = rs_gen.generate_redesign_suggestions(rs_input,task_type)
+            jd_text_clean = remove_tags(jd_text)
 
-            report_type = "single_task"
-
-        # 4) MULTI-TASK =============================================
-        else:
-            tasks_data_raw = extract_multi_task_tags(jd_text)
-
-            tasks_data = map_extractor_to_calculator(tasks_data_raw)
-
-            calc_result = calc.compute_multi_task(
-                tasks_data, job_description=jd_text_clean
-            )
-
-            with LLM_SEMAPHORE:
-                ja_text = remove_tags(
-                    ja_gen.generate_multi_task_job_analysis(calc_result.as_dict(),task_type)
+            # -------------------------------------------------------
+            # 2B) JD SPECIFICA + COMBINATA
+            # -------------------------------------------------------
+            if not is_multi:
+                # SINGLE / REPETITIVE → dual version classica
+                dual_versions = jd_gen.generate_dual_version(
+                    user_input=text,
+                    unit_system="imperial",
+                    task_type=task_type,
+                    parameters=None,
                 )
-            with LLM_SEMAPHORE:
+
+                jd_specific = remove_tags(dual_versions.get("specific_version", ""))
+                jd_combined = remove_tags(dual_versions.get("combined_version", ""))
+
+                calc_result = None  # lo calcoliamo dopo
+
+            else:
+                # MULTI-TASK → estraggo i task, mappo e calcolo prima il multi-task
+                raw_tasks = extract_multi_task_tags(jd_text)
+                tasks_data = map_extractor_to_calculator(raw_tasks)
+                calc_result = calc.compute_multi_task(
+                    tasks_data, job_description=jd_text_clean
+                )
+
+                dual_mt = jd_gen.generate_multi_task_dual_job_description(
+                    calc_result, task_type
+                )
+
+                jd_specific = remove_tags(dual_mt["specific_version"])
+                jd_combined = remove_tags(dual_mt["combined_version"])
+
+            # -------------------------------------------------------
+            # 3) PARAMETRI, CALCOLI & SEZIONI ANALITICHE
+            # -------------------------------------------------------
+            params_obj = None
+            ja_text = ha_text = rs_text = ""
+            ja_specific = ja_combined = ""
+            ha_specific = ha_combined = ""
+            rs_specific = rs_combined = ""
+
+            if not is_multi:
+                # --- SINGLE / REPETITIVE ---
+                params_raw = extract_tagged_params(jd_text) or {}
+                params_full = intelligent_llm_prevalidator(params_raw, jd_text)
+                params_obj = NIOSHParameters(**params_full)
+
+                # Calcolo NIOSH singolo task
+                calc_result = calc.compute(params_obj)
+
+                # JOB ANALYSIS (testo “normale” + dual specific/combined)
+                ja_text = remove_tags(
+                    ja_gen.generate_job_analysis(params_obj, task_type)
+                )
+                ja_dual = ja_gen.generate_dual_job_analysis(params_obj, task_type)
+                ja_specific = remove_tags(ja_dual["ja_specific"])
+                ja_combined = remove_tags(ja_dual["ja_combined"])
+
+                # HAZARD ASSESSMENT
+                hz_input = HazardAssessmentInput(
+                    task_description=jd_text_clean,
+                    weight_lbs=params_obj.weight,
+                    rwl_origin_lbs=calc_result.rwl_origin_lbs,
+                    rwl_dest_lbs=calc_result.rwl_destination_lbs,
+                    li_origin=calc_result.li_origin,
+                    li_dest=calc_result.li_destination,
+                    significant_control=params_obj.significant_control,
+                )
+
+                ha_text = remove_tags(
+                    hz_gen.generate_hazard_assessment(hz_input, task_type)
+                )
+                ha_dual = hz_gen.generate_dual_hazard_assessment(hz_input, task_type)
+                ha_specific = remove_tags(ha_dual["ha_specific"])
+                ha_combined = remove_tags(ha_dual["ha_combined"])
+
+                # REDESIGN SUGGESTIONS
+                rs_input = RedesignSuggestionsInput(
+                    task_description=jd_text_clean,
+                    h_origin=params_obj.horizontal_origin,
+                    h_dest=params_obj.horizontal_destination,
+                    v_origin=params_obj.vertical_origin,
+                    v_dest=params_obj.vertical_destination,
+                    a_origin=params_obj.asymmetry_angle,
+                    a_dest=params_obj.asymmetry_angle,
+                    frequency_lifts_per_min=params_obj.frequency,
+                    duration_class=params_obj.duration,
+                    coupling=params_obj.coupling,
+                    significant_control=params_obj.significant_control,
+                    weight_lbs=params_obj.weight,
+                    rwl_origin_lbs=calc_result.rwl_origin_lbs,
+                    rwl_dest_lbs=calc_result.rwl_destination_lbs,
+                    li_origin=calc_result.li_origin,
+                    li_dest=calc_result.li_destination,
+                    multipliers_origin=calc_result.multipliers_origin,
+                    multipliers_destination=calc_result.multipliers_destination,
+                    risk_category=calc_result.risk_category,
+                    risk_comment=calc_result.risk_comment,
+                )
+
+                rs_dual = rs_gen.generate_dual_redesign_suggestions(
+                    rs_input, task_type
+                )
+                rs_specific = remove_tags(rs_dual["rs_specific"])
+                rs_combined = remove_tags(rs_dual["rs_combined"])
+
+                report_type = "single_task"
+
+            else:
+                # --- MULTI-TASK ---
+                # Testi “normali”
+                ja_text = remove_tags(
+                    ja_gen.generate_multi_task_job_analysis(calc_result, task_type)
+                )
                 ha_text = remove_tags(
                     hz_gen.generate_multi_task_hazard_assessment(calc_result)
                 )
-            with LLM_SEMAPHORE:
-                rs_text = remove_tags(rs_gen.generate_multi_task_redesign(calc_result))
+                rs_text = remove_tags(
+                    rs_gen.generate_multi_task_redesign(calc_result)
+                )
 
-            report_type = "multi_task"
+                # Dual multi-task (specific + combined)
+                ja_dual = ja_gen.generate_multi_task_dual_job_analysis(
+                    calc_result, task_type
+                )
+                ja_specific = remove_tags(ja_dual["ja_specific"])
+                ja_combined = remove_tags(ja_dual["ja_combined"])
 
-        # 5) Salvataggio ============================================
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        safe_name = "".join(c if c.isalnum() else "_" for c in text[:40])
+                ha_dual = hz_gen.generate_multi_task_dual_hazard_assessment(
+                    calc_result, task_type
+                )
+                ha_specific = remove_tags(ha_dual["ha_specific"])
+                ha_combined = remove_tags(ha_dual["ha_combined"])
 
-        # Create subdirectory for task type
-        type_dir = Path(output_dir) / task_type
-        type_dir.mkdir(parents=True, exist_ok=True)
+                rs_dual = rs_gen.generate_multi_task_dual_redesign_suggestions(
+                    calc_result, task_type
+                )
+                rs_specific = remove_tags(rs_dual["rs_specific"])
+                rs_combined = remove_tags(rs_dual["rs_combined"])
 
-        json_path = type_dir / f"{safe_name}_{idx}.json"
-        md_path = type_dir / f"{safe_name}_{idx}.md"
+                report_type = "multi_task"
 
-        json_data = {
-            "input": text,
-            "timestamp": timestamp,
-            "description": jd_text_clean,  # <-- SALVIAMO LA VERSIONE SENZA TAG
-            "analysis": {
-                "job_analysis": ja_text,
-                "hazard_assessment": ha_text,
-                "redesign_suggestions": rs_text,
-            },
-            "calculations": (
-                calc_result.as_dict()
-                if report_type == "single_task"
-                else {
-                    "CLI": calc_result.cli,
-                    "risk_category": calc_result.risk_category,
-                    "risk_comment": calc_result.risk_comment,
-                    "tasks": [t.__dict__ for t in calc_result.tasks],
-                }
-            ),
-        }
+            # -------------------------------------------------------
+            # 3C-1) VALUTAZIONE GEMINI — SPECIFIC VERSIONS
+            # -------------------------------------------------------
+            eval_jd_specific = judge.evaluate(
+                JudgeInput(
+                    section_name="job_description_specific",
+                    human_text=jd_gen.get_reference_examples(task_type),
+                    ai_text=jd_specific,
+                    reference_examples=jd_gen.get_reference_examples(task_type),
+                )
+            )
 
-        with open(json_path, "w", encoding="utf-8") as jf:
-            json.dump(json_data, jf, indent=2, ensure_ascii=False)
+            eval_ja_specific = judge.evaluate(
+                JudgeInput(
+                    section_name="job_analysis_specific",
+                    human_text=ja_gen.get_reference_examples(task_type),
+                    ai_text=ja_specific,
+                    reference_examples=ja_gen.get_reference_examples(task_type),
+                )
+            )
 
-        report_md = f"""# NIOSH Analysis Report
+            eval_ha_specific = judge.evaluate(
+                JudgeInput(
+                    section_name="hazard_assessment_specific",
+                    human_text=hz_gen.get_reference_examples(task_type),
+                    ai_text=ha_specific,
+                    reference_examples=hz_gen.get_reference_examples(task_type),
+                )
+            )
+
+            eval_rs_specific = judge.evaluate(
+                JudgeInput(
+                    section_name="redesign_suggestions_specific",
+                    human_text=rs_gen.get_reference_examples(task_type),
+                    ai_text=rs_specific,
+                    reference_examples=rs_gen.get_reference_examples(task_type),
+                )
+            )
+
+            # -------------------------------------------------------
+            # 3C-2) VALUTAZIONE GEMINI — COMBINED VERSIONS
+            # -------------------------------------------------------
+            eval_jd_combined = judge.evaluate(
+                JudgeInput(
+                    section_name="job_description_combined",
+                    human_text=jd_gen.get_reference_examples(task_type),
+                    ai_text=jd_combined,
+                    reference_examples=jd_gen.get_reference_examples(task_type),
+                )
+            )
+
+            eval_ja_combined = judge.evaluate(
+                JudgeInput(
+                    section_name="job_analysis_combined",
+                    human_text=ja_gen.get_reference_examples(task_type),
+                    ai_text=ja_combined,
+                    reference_examples=ja_gen.get_reference_examples(task_type),
+                )
+            )
+
+            eval_ha_combined = judge.evaluate(
+                JudgeInput(
+                    section_name="hazard_assessment_combined",
+                    human_text=hz_gen.get_reference_examples(task_type),
+                    ai_text=ha_combined,
+                    reference_examples=hz_gen.get_reference_examples(task_type),
+                )
+            )
+
+            eval_rs_combined = judge.evaluate(
+                JudgeInput(
+                    section_name="redesign_suggestions_combined",
+                    human_text=rs_gen.get_reference_examples(task_type),
+                    ai_text=rs_combined,
+                    reference_examples=rs_gen.get_reference_examples(task_type),
+                )
+            )
+
+            # -------------------------------------------------------
+            # 4) SALVATAGGI FILE
+            # -------------------------------------------------------
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            safe_name = "".join(c if c.isalnum() else "_" for c in text[:40])
+
+            type_dir = Path(output_dir) / task_type
+            type_dir.mkdir(parents=True, exist_ok=True)
+
+            json_path = type_dir / f"{safe_name}_{idx}.json"
+            md_path = type_dir / f"{safe_name}_{idx}.md"
+            specific_md_path = type_dir / f"{safe_name}_{idx}_JD_SPECIFIC.md"
+            combined_md_path = type_dir / f"{safe_name}_{idx}_JD_COMBINED.md"
+
+            # -------------------------------------------------------
+            # 5) JSON STRUCT COMPLETO (analisi + valutazioni)
+            # -------------------------------------------------------
+            json_data = {
+                "input": text,
+                "timestamp": timestamp,
+                "task_type": task_type,
+                "jd_specific": jd_specific,
+                "jd_combined": jd_combined,
+                "jd_final_clean": jd_text_clean,
+                "analysis": {
+                    "job_analysis": ja_text,
+                    "hazard_assessment": ha_text,
+                    "redesign_suggestions": rs_text,
+                    "job_analysis_specific": ja_specific,
+                    "job_analysis_combined": ja_combined,
+                    "hazard_assessment_specific": ha_specific,
+                    "hazard_assessment_combined": ha_combined,
+                    "redesign_suggestions_specific": rs_specific,
+                    "redesign_suggestions_combined": rs_combined,
+                },
+                "evaluation": {
+                    "jd_specific_eval": eval_jd_specific,
+                    "jd_combined_eval": eval_jd_combined,
+                    "ja_specific_eval": eval_ja_specific,
+                    "ja_combined_eval": eval_ja_combined,
+                    "ha_specific_eval": eval_ha_specific,
+                    "ha_combined_eval": eval_ha_combined,
+                    "rs_specific_eval": eval_rs_specific,
+                    "rs_combined_eval": eval_rs_combined,
+                },
+                "calculations": (
+                    calc_result.as_dict()
+                    if report_type == "single_task"
+                    else {
+                        "CLI": calc_result.cli,
+                        "risk_category": calc_result.risk_category,
+                        "risk_comment": calc_result.risk_comment,
+                        "tasks": [t.__dict__ for t in calc_result.tasks],
+                    }
+                ),
+            }
+
+            print(f"SALVO → {json_path}")
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(json_data, f, indent=2, ensure_ascii=False)
+
+            # -------------------------------------------------------
+            # 6) MARKDOWN – SPECIFICA / COMBINATA
+            # -------------------------------------------------------
+            jd_spec_md = f"""# Job Description – SPECIFIC VERSION
 
     **Scenario:** {text}  
     **Generated:** {timestamp}  
     **Model:** {model}  
 
-    ## Job Description
-    {jd_text_clean}
+    ## Job Description 
+    {jd_specific}
 
-    ## Job Analysis
-    {ja_text}
+    ## Job Analysis 
+    {ja_specific}
 
-    ## Hazard Assessment
-    {ha_text}
+    ## Hazard Assessment 
+    {ha_specific}
 
     ## Redesign Suggestions
-    {rs_text}
+    {rs_specific}
     """
-        # Clean tags from Markdown report
-        report_md = re.sub(r"\[[A-Z0-9]+:[^\]]+\]", "", report_md)
-        report_md = re.sub(r"[ \t]+", " ", report_md)
+            with open(specific_md_path, "w", encoding="utf-8", buffering=65536) as mf:
+                mf.write(jd_spec_md)
 
-        with open(md_path, "w", encoding="utf-8") as mf:
-            mf.write(report_md)
+            jd_comb_md = f"""# Job Description – COMBINED VERSION
 
-        return idx, json_path, md_path
+    **Scenario:** {text}  
+    **Generated:** {timestamp}  
+    **Model:** {model}  
+
+    ## Job Description 
+    {jd_combined}
+
+    ## Job Analysis 
+    {ja_combined}
+
+    ## Hazard Assessment 
+    {ha_combined}
+
+    ## Redesign Suggestions
+    {rs_combined}
+    """
+            with open(combined_md_path, "w", encoding="utf-8", buffering=65536) as mf:
+                mf.write(jd_comb_md)
+
+            # markdown principale (se vuoi mantenerlo compatibile)
+            with open(md_path, "w", encoding="utf-8", buffering=65536) as mf:
+                mf.write(jd_comb_md)
+
+            return idx, json_path, md_path
+
+        except Exception as e:
+            print(f"[ERROR] Failed to process scenario {idx}: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return idx, None, None
+
 
     # ================================================
-    #   PARALLEL EXECUTION 🚀
+    #   PARALLEL EXECUTION
     # ================================================
     futures = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -337,51 +517,57 @@ def batch_process_file(
             futures.append(executor.submit(process_single_scenario, idx, text))
 
         for future in as_completed(futures):
-            idx, json_path, md_path = future.result()
-            print(f"✓ Scenario {idx} completed → {json_path}")
+            result = future.result()
+            if result[1] is not None:
+                idx, json_path, md_path = result
+                print(f"✓ Scenario {idx} completed → {json_path}")
+            else:
+                print(f"✗ Scenario {result[0]} failed")
 
     print("\n=== Parallel Batch Processing Completed ===")
+
 
 
 # Note: retry_logic import skipped to avoid import issues
 def detect_multi_task(user_text: str) -> bool:
     """
-    Ritorna True se il job sembra MULTI-TASK secondo logica NIOSH.
-    Ritorna False se sembra SINGLE-TASK.
+    Classifica la frase come MULTI-TASK se contiene indicatori semantici,
+    lessicali o strutturali di compiti multipli.
+    Restituisce False solo quando è chiaramente single-task.
     """
 
-    txt = user_text.lower()
+    txt = user_text.lower().strip()
 
-    # Pattern molto forti (quasi sempre multi-task)
+    # ============================================================
+    # 1) PATTERN FORTI (quasi sempre multi-task)
+    # ============================================================
     strong_multi = [
-        r"\btier\b",
-        r"\btiers\b",
+        r"\btier\b", r"\btiers\b",
         r"\blevels\b",
         r"\blayers\b",
-        r"\bmultiple tasks\b",
-        r"\bdifferent tasks\b",
-        r"\bvarious tasks\b",
+        r"\bmultiple tasks?\b",
+        r"\bdifferent tasks?\b",
+        r"\bvarious tasks?\b",
         r"\bmulti[- ]?task\b",
-        r"\bseveral tasks\b",
-        r"\bdistinct tasks\b",
+        r"\bseveral tasks?\b",
+        r"\bdistinct tasks?\b",
         r"\bdifferent heights\b",
         r"\bdifferent shelves\b",
         r"\bmultiple shelves\b",
-        r"\btask 1\b",
-        r"\btask 2\b",
-        r"\btask 3\b",
-        r"\bfirst task\b",
-        r"\bsecond task\b",
+        r"\btask\s*1\b", r"\btask\s*2\b", r"\btask\s*3\b",
+        r"\bfirst task\b", r"\bsecond task\b", r"\bthird task\b",
     ]
 
     for pat in strong_multi:
         if re.search(pat, txt):
             return True
 
-    # Pattern medio-forti (es. depalletizing)
+    # ============================================================
+    # 2) PATTERN MEDIO-FORTI (strutture sequenziali fisiche)
+    # ============================================================
     medium_multi = [
-        r"\b(top|middle|bottom) (shelf|tier|row)\b",
-        r"\bfrom .* to .* to\b",  # es. "from cart to shelf 1 to shelf 2"
+        r"\b(top|middle|bottom)\s+(shelf|tier|row)\b",
+        r"\bfrom\b.+\bto\b.+\bto\b",          # da X a Y a Z
         r"\bthree shelves\b",
         r"\bfive tiers\b",
         r"\bstacked\b",
@@ -393,23 +579,64 @@ def detect_multi_task(user_text: str) -> bool:
         if re.search(pat, txt):
             return True
 
-    # Pattern basato su numeri multipli di altezze/posizioni
-    # se riconosciamo 3+ valori verticali → probabile multitask
+    # ============================================================
+    # 3) RILEVATORE DI SEQUENZE (fondamentale!)
+    # ============================================================
+    sequence_markers = [
+        " then ",
+        " next ",
+        " after that ",
+        " followed by ",
+        " and finally ",
+        " first ",
+        " secondly ",
+        " third ",
+    ]
+
+    # Le sequenze sono il segnale più naturale di multi-task umano
+    occurrences = sum(1 for m in sequence_markers if m in txt)
+    if occurrences >= 1:
+        return True
+
+    # ============================================================
+    # 4) TRIGRAMMI DI AZIONI → 3+ verbi dinamici diversi
+    # ============================================================
+    # Riconosce “solleva… sposta… deposita…”
+    verbs = re.findall(
+        r"\b(lift|move|carry|place|set|pick up|put|transfer|raise|lower|load|unload)\b",
+        txt
+    )
+
+    # Se troviamo 3+ verbi d'azione diversi → quasi certamente multi-task
+    if len(set(verbs)) >= 3:
+        return True
+
+    # ============================================================
+    # 5) Pattern numerici → molte altezze diverse = multi-task implicito
+    # ============================================================
+    # Tre o più valori verticali → probabile sequenza multipla
     vertical_values = re.findall(r"\b(\d+)\s*(?:in|cm)\b", txt)
     if len(vertical_values) >= 3:
         return True
 
-    # Se menziona 3 o più destinazioni/origini differenti
+    # Molte destinazioni/origini menzionate
     if len(re.findall(r"\b(origin|destination)\b", txt)) >= 3:
         return True
 
-    # Se menziona 3 o più oggetti diversi
+    # Tre o più oggetti distinti → indica più fasi
     if len(re.findall(r"\bbox\b|\bcontainer\b|\broll\b|\bcan\b", txt)) >= 3:
         return True
 
-    # Nessun pattern multi-task rilevato
-    return False
+    # ============================================================
+    # 6) FALLBACK: se la frase è lunga e con molte azioni → multi
+    # ============================================================
+    if len(txt.split()) >= 25 and len(set(verbs)) >= 2:
+        return True
 
+    # ============================================================
+    # DEFAULT: single-task
+    # ============================================================
+    return False
 
 def get_model_selection():
     """Ask user to choose between single model and multi-model mode"""
@@ -466,7 +693,7 @@ def get_batch_file_info():
     console.print("\n[bold cyan]BATCH PROCESSING CONFIGURATION[/bold cyan]")
 
     # Use default file path automatically (relative path)
-    default_file_path = "scenari_niosh_fps.txt"
+    default_file_path = "scenari_niosh_fps3.txt"
     file_path = default_file_path
     lines = []
 
@@ -935,7 +1162,7 @@ def generate_report_with_gemini(
 
                 if result and result.get("parameters"):
                     console.print(
-                        f"[green]✅ Successfully analyzed job with {generator.model}[/]"
+                        f"[green]Successfully analyzed job with {generator.model}[/]"
                     )
                     break
                 else:
@@ -1006,8 +1233,8 @@ def generate_report_with_gemini(
                 generate_section_with_retry(
                     ja_gen.generate_job_analysis, p, "Job Analysis"
                 )
-            )
-            console.print(f"[green]✅ Job analysis generated with {ja_gen.model}[/]")
+            )   
+            console.print(f"Job analysis generated with {ja_gen.model}")
 
             hz_input = HazardAssessmentInput(
                 task_description=description_clean,
@@ -1024,7 +1251,7 @@ def generate_report_with_gemini(
                 )
             )
             console.print(
-                f"[green]✅ Hazard assessment generated with {hz_gen.model}[/]"
+                f"Hazard assessment generated with {hz_gen.model}"
             )
 
             rs_input = RedesignSuggestionsInput(
@@ -1053,11 +1280,11 @@ def generate_report_with_gemini(
                 rs_gen.generate_redesign_suggestions, rs_input, "Redesign Suggestions"
             )
             console.print(
-                f"[green]✅ Redesign suggestions generated with {rs_gen.model}[/]"
+                f"Redesign suggestions generated with {rs_gen.model}"
             )
 
         except Exception as e:
-            console.print(f"[red]Failed to generate report sections: {e}[/]")
+            console.print(f"Failed to generate report sections: {e}")
             return []
 
         # Step 4: Create report and save files
@@ -1143,6 +1370,76 @@ def generate_report_with_gemini(
         return []
 
 
+def generate_multi_task_report_single_model(
+    user_input, generator, calc, ja_gen, hz_gen, rs_gen, task_type="multi"
+):
+    """Generate multi-task report using single model pipeline."""
+
+    console.print("[cyan]Detected MULTI-TASK → switching to multi-task pipeline[/]")
+
+    # Qui usi la pipeline multi-task (la stessa del batch)
+    job_desc_result = generator.analyze_job(user_input)
+    jd_text = job_desc_result["description"]
+    tasks_data_raw = extract_multi_task_tags(jd_text)
+    tasks_data = map_extractor_to_calculator(tasks_data_raw)
+    calc_result = calc.compute_multi_task(tasks_data, job_description=jd_text)
+
+    ja_text = remove_tags(ja_gen.generate_multi_task_job_analysis(calc_result))
+    ha_text = remove_tags(hz_gen.generate_multi_task_hazard_assessment(calc_result))
+    rs_text = remove_tags(rs_gen.generate_multi_task_redesign(calc_result))
+    # --- Save Report Logic ---
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_dir = Path("reports") / task_type
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    base_filename = f"niosh_multitask_{timestamp}"
+
+    # 1. Construct Full Report (Markdown)
+    full_report_md = f"# NIOSH Multi-Task Analysis Report\n\n"
+    full_report_md += f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+    full_report_md += f"**Job Description:** {jd_text}\n\n"
+    full_report_md += f"## Job Analysis\n\n{ja_text}\n\n"
+    full_report_md += f"## Hazard Assessment\n\n{ha_text}\n\n"
+    full_report_md += f"## Redesign Suggestions\n\n{rs_text}\n\n"
+
+    # 2. Clean Tags for Final Output (preserving newlines)
+    # Remove [TAG:value] patterns
+    clean_report_md = re.sub(r"\[[a-zA-Z0-9]+:[^\]]+\]", "", full_report_md)
+    # Clean up multiple spaces but preserve newlines
+    clean_report_md = re.sub(r"[ \t]+", " ", clean_report_md)
+
+    # 3. Save Markdown File
+    md_path = report_dir / f"{base_filename}.md"
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(clean_report_md)
+
+    # 4. Save JSON Data (Raw + Sections)
+    json_data = {
+        "timestamp": datetime.now().isoformat(),
+        "input": user_input,
+        "calculation_result": calc_result.as_dict(),
+        "sections": {
+            "job_description": jd_text,
+            "job_analysis": ja_text,
+            "hazard_assessment": ha_text,
+            "redesign_suggestions": rs_text,
+        },
+    }
+
+    json_path = report_dir / f"{base_filename}.json"
+    with open(json_path, "w", encoding="utf-8", buffering=65536) as f:
+        json.dump(json_data, f, indent=2, ensure_ascii=False)
+
+    # 5. User Feedback
+    console.print(f"\n[success]Multi-task analysis completed![/]")
+    console.print(f"[info]Report saved to: {md_path}[/]")
+    console.print(f"[info]Data saved to: {json_path}[/]")
+
+    # Show preview (clean)
+    console.print("\n[bold]Report Preview:[/]\n")
+    console.print(clean_report_md)
+
+
 def generate_single_model_report(
     user_input,
     generator,
@@ -1153,51 +1450,50 @@ def generate_single_model_report(
     auto_save=False,
     task_type="single_task",
 ):
-    """Generate report using single model in SINGLE-TASK mode only."""
+    """
+    Versione CORRETTA con:
+    - Gestione task_type consistente
+    - Fix valori di default
+    - Migliore error handling
+    """
 
     try:
-        # Step 1: Unified pipeline → ma forziamo SINGLE-TASK
+        
+        if task_type == "repetitive":
+            console.print("[info]Repetitive task → using SINGLE-TASK RNLE[/]")
+            task_type = "single"  # Normalizza per evitare confusione
+
+        # Step 1: Analisi job
         result = generator.analyze_job(user_input)
         if not result:
-            console.print("[danger]ERROR: Job analysis failed (no result returned).[/]")
-            return
+            console.print("[danger]ERROR: Job analysis failed[/]")
+            return None
 
         mode = result.get("mode", "single-task")
         if mode != "single-task":
-            console.print("[danger]ERROR: Input detected as MULTI-TASK by analyzer.[/]")
-            console.print(
-                "[info]Use the multi-task / multi-model pipeline for this description.[/]"
-            )
-            return
+            console.print("[danger]ERROR: Multi-task detected in single-task mode[/]")
+            return "MULTI_DETECTED"
 
         params_raw = result.get("parameters")
         if not params_raw:
-            console.print("[danger]ERROR: Parameters not extracted.[/]")
-            return
+            console.print("[danger]ERROR: Parameters not extracted[/]")
+            return None
 
-        # ---- Recupero descrizione con tag ----
-        description = (
-            result.get("description")
-            or result.get("description_clean")
-            or result.get("description_with_tags")
-            or ""
-        )
-
-        # ---- FIX: Rimuoviamo i tag dalla Job Description ----
+        description = result.get("description", "")
         description_clean = remove_tags(description)
 
-        # ---- PREVALIDATORE LLM ----
+      
         params_filled = intelligent_llm_prevalidator(params_raw, description)
 
-        # ---- DEFAULTS per valori None ----
+        # Default values NIOSH-compliant
         default_values = {
             "weight": 25.0,
-            "horizontal_origin": 20.0,
-            "horizontal_destination": 20.0,
-            "vertical_origin": 30.0,
-            "vertical_destination": 30.0,
+            "horizontal_origin": 25.0,  # Standard 10" (25cm)
+            "horizontal_destination": 25.0,
+            "vertical_origin": 75.0,  # Standard 30" (75cm)
+            "vertical_destination": 75.0,
             "asymmetry_angle": 0.0,
-            "frequency": 0.1,
+            "frequency": 0.2,  # 1 lift per 5 min
             "duration": "<1h",
             "coupling": "fair",
             "significant_control": False,
@@ -1207,50 +1503,33 @@ def generate_single_model_report(
             "two_operators_lifting": False,
         }
 
-        for key in default_values:
-            if key in params_filled and params_filled[key] is None:
-                params_filled[key] = default_values[key]
-            elif key not in params_filled:
-                params_filled[key] = default_values[key]
+        # Applica defaults solo se valori mancanti
+        for key, default_val in default_values.items():
+            if key not in params_filled or params_filled[key] is None:
+                params_filled[key] = default_val
 
-        # ---- VALIDAZIONE ----
+        # Validazione parametri
         ok, err = validate_params(params_filled)
         if not ok:
-            console.print(f"[danger]Validation error: {err}[/]")
-            console.print("[yellow]Using fallback default parameters...[/]")
-            params_filled = default_values.copy()
+            console.print(f"[yellow]Validation warning: {err}[/]")
+            console.print("[info]Continuing with corrected parameters...[/]")
 
-        # ---- COSTRUZIONE PARAMETRI FINALI ----
+        # Costruzione parametri NIOSH
         try:
             p = NIOSHParameters(**params_filled)
         except Exception as e:
-            console.print(f"[danger]Error creating NIOSHParameters: {e}[/]")
-            console.print("[yellow]Using basic fallback parameters...[/]")
-            p = NIOSHParameters(
-                weight=25.0,
-                horizontal_origin=20.0,
-                horizontal_destination=20.0,
-                vertical_origin=30.0,
-                vertical_destination=30.0,
-                asymmetry_angle=0.0,
-                frequency=0.1,
-                duration="<1h",
-                coupling="fair",
-                significant_control=False,
-            )
+            console.print(f"[danger]Error creating parameters: {e}[/]")
+            console.print("[yellow]Using safe defaults...[/]")
+            p = NIOSHParameters(**default_values)
 
-        # Step 2: RNLE
+        # Step 2: Calcoli RNLE
         calc_result = calc.compute(p)
 
-        # Step 3: Generate report sections (SINGLE-TASK)
+        # Step 3: Genera sezioni report
+        job_analysis = remove_tags(ja_gen.generate_job_analysis(p))
 
-        # ---- Job Analysis ----
-        job_analysis_tagged = ja_gen.generate_job_analysis(p)
-        job_analysis = remove_tags(job_analysis_tagged)
-
-        # ---- Hazard Assessment ----
         hz_input = HazardAssessmentInput(
-            task_description=description_clean,  # JD senza TAG
+            task_description=description_clean,
             weight_lbs=p.weight,
             rwl_origin_lbs=calc_result.rwl_origin_lbs,
             rwl_dest_lbs=calc_result.rwl_destination_lbs,
@@ -1258,12 +1537,10 @@ def generate_single_model_report(
             li_dest=calc_result.li_destination,
             significant_control=p.significant_control,
         )
-        hazard_assessment_tagged = hz_gen.generate_hazard_assessment(hz_input)
-        hazard_assessment = remove_tags(hazard_assessment_tagged)
+        hazard_assessment = remove_tags(hz_gen.generate_hazard_assessment(hz_input))
 
-        # ---- Redesign Suggestions ----
         rs_input = RedesignSuggestionsInput(
-            task_description=description_clean,  # JD senza TAG
+            task_description=description_clean,
             h_origin=p.horizontal_origin,
             h_dest=p.horizontal_destination,
             v_origin=p.vertical_origin,
@@ -1284,11 +1561,10 @@ def generate_single_model_report(
             risk_category=calc_result.risk_category,
             risk_comment=calc_result.risk_comment,
         )
-        redesign_suggestions_tagged = rs_gen.generate_redesign_suggestions(rs_input)
-        redesign_suggestions = remove_tags(redesign_suggestions_tagged)
+        redesign_suggestions = remove_tags(rs_gen.generate_redesign_suggestions(rs_input))
 
-        # Step 4: Create report
-        timestamp = __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Step 4: Crea report
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         professional_report = f"""# NIOSH Lifting Analysis Report
 
 **Generated:** {timestamp}
@@ -1307,63 +1583,82 @@ def generate_single_model_report(
 {redesign_suggestions}
 """
 
-        # Step 5: Save files
+        # Step 5: Salva files
         if auto_save or get_save_confirmation():
-            import json
+            report_dir = Path("report") / task_type
+            report_dir.mkdir(parents=True, exist_ok=True)
 
-            report_dir = Path("report")
-            report_dir.mkdir(exist_ok=True)
+            safe_name = "".join([c if c.isalnum() else "_" for c in user_input[:30]]).strip("_")
+            timestamp_short = int(time.time())
+            base_filename = f"niosh_single_{safe_name}_{timestamp_short}"
 
-            safe_name = "".join(
-                [c if c.isalnum() else "_" for c in user_input[:30]]
-            ).strip("_")
-            base_filename = f"niosh_single_{safe_name}_{int(__import__('time').time())}"
-
+            
             json_data = {
-                "input_phrase": user_input,
-                "description": description_clean,  # JD senza TAG
+                "metadata": {
+                    "timestamp": timestamp,
+                    "analysis_type": task_type,
+                    "input_phrase": user_input,
+                },
+                "description": description_clean,
                 "parameters": params_filled,
-                "niosh_calculation": calc_result.as_dict(),
-                "job_analysis_text": job_analysis,
-                "hazard_assessment_text": hazard_assessment,
-                "redesign_suggestions_text": redesign_suggestions,
-                "timestamp": timestamp,
-                "analysis_type": "single_task_single_model",
+                "niosh_calculation": {
+                    "rwl_origin_lbs": calc_result.rwl_origin_lbs,
+                    "rwl_destination_lbs": calc_result.rwl_destination_lbs,
+                    "li_origin": calc_result.li_origin,
+                    "li_destination": calc_result.li_destination,
+                    "multipliers_origin": calc_result.multipliers_origin,
+                    "multipliers_destination": calc_result.multipliers_destination,
+                    "risk_category": calc_result.risk_category,
+                    "risk_comment": calc_result.risk_comment,
+                },
+                "sections": {
+                    "job_analysis": job_analysis,
+                    "hazard_assessment": hazard_assessment,
+                    "redesign_suggestions": redesign_suggestions,
+                },
             }
 
+            
             json_filename = report_dir / f"{base_filename}.json"
             with open(json_filename, "w", encoding="utf-8") as f:
                 json.dump(json_data, f, indent=2, ensure_ascii=False)
 
+            # Salva Markdown
             md_filename = report_dir / f"{base_filename}.md"
             with open(md_filename, "w", encoding="utf-8") as f:
                 f.write(professional_report)
 
-            console.print(
-                f"[success]Report saved: {json_filename} and {md_filename}[/]"
-            )
+            console.print(f"[success]Report saved: {json_filename} and {md_filename}[/]")
 
         # Display summary
-        console.print("\n[bold green]Analysis Complete![/]")
+        console.print("\n[bold green]✓ Analysis Complete![/]")
         console.print(f"[info]LI Origin: {calc_result.li_origin:.2f}[/]")
         if calc_result.li_destination is not None:
             console.print(f"[info]LI Destination: {calc_result.li_destination:.2f}[/]")
         console.print(f"[info]Risk Category: {calc_result.risk_category}[/]")
         console.print(f"[info]RWL Origin: {calc_result.rwl_origin_lbs:.1f} lbs[/]")
         if calc_result.rwl_destination_lbs is not None:
-            console.print(
-                f"[info]RWL Destination: {calc_result.rwl_destination_lbs:.1f} lbs[/]"
-            )
+            console.print(f"[info]RWL Destination: {calc_result.rwl_destination_lbs:.1f} lbs[/]")
+
+        return "SUCCESS"
 
     except Exception as e:
         console.print(f"[danger]Error in analysis: {e}[/]")
         import traceback
-
         traceback.print_exc()
+        return None
+
 
 
 def interactive_chat():
-    """Enhanced interactive chat with Rich formatting following ss/cli.py pattern"""
+    """
+    Enhanced interactive chat with Rich formatting.
+    VERSIONE CORRETTA con:
+    - Rimozione duplicazione generators
+    - Gestione task_type normalizzata
+    - Logica multi-model ottimizzata
+    - Error handling robusto
+    """
 
     # Display welcome message with Rich
     console.print(create_welcome_panel())
@@ -1397,6 +1692,8 @@ def interactive_chat():
             )
         except Exception as e:
             console.print(f"[danger]Error during batch processing: {e}[/]")
+            import traceback
+            traceback.print_exc()
 
         continue_choice = (
             console.input(
@@ -1411,46 +1708,59 @@ def interactive_chat():
             show_goodbye_message()
             return
 
+    # ===================================================================
+    # INTERACTIVE MODE - Inizializzazione
+    # ===================================================================
+    
     # Interactive mode continues with model selection
     use_multi_model = get_model_selection()
     mode_text = "Multi-Model Mode" if use_multi_model else "Single Model Mode"
     console.print(f"\n[info]Selected: {mode_text}[/]\n")
 
+    # Health check Ollama
     console.print("[info]Checking Ollama service health...[/]")
     try:
         import requests
 
         response = requests.get("http://localhost:11434/api/tags", timeout=3)
         if response.status_code == 200:
-            console.print("[success] Ollama service is healthy![/]")
+            console.print("[success]✓ Ollama service is healthy![/]")
         else:
             console.print(
-                f"[yellow]Warning: Ollama responded with status {response.status_code}[/]"
+                f"[yellow]⚠ Warning: Ollama responded with status {response.status_code}[/]"
             )
             console.print("[yellow]Continuing anyway...[/]")
     except Exception as e:
-        console.print(f"[yellow]Warning: Could not connect to Ollama: {e}[/]")
+        console.print(f"[yellow]⚠ Warning: Could not connect to Ollama: {e}[/]")
         console.print("[yellow]Continuing anyway...[/]")
 
     if use_multi_model:
         console.print("[info]Google Gemini status: Will be checked during execution[/]")
 
+    
     console.print("[info]Initializing generators...[/]")
     try:
+        # Single shared instance per ogni tipo di generator
         generator = NIOSHJobDescriptionGenerator()
         calc = NIOSHCalculator()
-        jd_gen = NIOSHJobDescriptionGenerator()
         ja_gen = NIOSHJobAnalysisGenerator()
         hz_gen = NIOSHHazardAssessmentGenerator()
         rs_gen = NIOSHRedesignSuggestionsGenerator()
-        console.print("[success]All generators ready![/]")
+        console.print("[success]✓ All generators ready![/]")
     except Exception as e:
-        console.print(f"[danger]Error initializing generators: {e}[/]")
+        console.print(f"[danger]✗ Error initializing generators: {e}[/]")
+        import traceback
+        traceback.print_exc()
         return
 
-    console.print("[info]Skipping Ollama client initialization (basic mode)[/]")
-    console.print("\n[bold green]SYSTEM READY FOR INPUT[/]")
+    console.print("\n[bold green]════════════════════════════════════════[/]")
+    console.print("[bold green]   SYSTEM READY FOR INPUT[/]")
+    console.print("[bold green]════════════════════════════════════════[/]\n")
 
+    # ===================================================================
+    # MAIN INTERACTION LOOP
+    # ===================================================================
+    
     while True:
         try:
             user_input = get_user_input()
@@ -1462,129 +1772,55 @@ def interactive_chat():
             if not validate_input_with_rich(user_input):
                 continue
 
+            
             task_type = classify_sentence(user_input)
             console.print(f"[info]Detected task type: [bold]{task_type}[/]")
 
+            
             if task_type == "repetitive":
                 console.print(
-                    "[info]Repetitive task detected → treating as SINGLE-TASK (RNLE rule)"
+                    "[info]Repetitive task → using SINGLE-TASK RNLE (per NIOSH guidelines)"
                 )
-                # Keep task_type as "repetitive" for folder organization
-                # task_type = "single"
+                # Normalizza per la pipeline, ma mantieni l'originale per logging
+                original_task_type = task_type
+                task_type = "single" 
+                console.print(f"[info]Task type normalized: {original_task_type} → {task_type}[/]")
 
-            is_multi = task_type == "multi"
+            is_multi = (task_type == "multi")
 
+            # ===================================================================
+            # MULTI-MODEL MODE
+            # ===================================================================
+            
             if use_multi_model:
-                # Multi-model: genera sempre più report, ma usa la pipeline giusta!
-                if is_multi:
-                    console.print(
-                        "[cyan]Using MULTI-TASK pipeline (multi-model mode)[/]"
-                    )
-                    generate_multi_model_reports(
-                        user_input,
-                        generator,
-                        calc,
-                        jd_gen,
-                        ja_gen,
-                        hz_gen,
-                        rs_gen,
-                        task_type=task_type,
-                    )
-                else:
-                    console.print(
-                        "[cyan]Using SINGLE-TASK pipeline (multi-model mode)[/]"
-                    )
-                    generate_multi_model_reports(
-                        user_input,
-                        generator,
-                        calc,
-                        jd_gen,
-                        ja_gen,
-                        hz_gen,
-                        rs_gen,
-                        task_type=task_type,
-                    )
+                console.print(f"\n[cyan]━━━ MULTI-MODEL PROCESSING ━━━[/cyan]")
+                console.print(f"[info]Task type: {task_type}[/]")
+                console.print(f"[info]Will generate reports with ALL available models[/]\n")
+                
+                
+                generate_multi_model_reports(
+                    user_input,
+                    generator,
+                    calc,
+                    ja_gen,
+                    hz_gen,
+                    rs_gen,
+                    task_type=task_type,
+                )
+
+            # ===================================================================
+            # SINGLE-MODEL MODE
+            # ===================================================================
+            
             else:
-                # Single-model mode
+                console.print(f"\n[green]━━━ SINGLE-MODEL PROCESSING ━━━[/green]")
+                console.print(f"[info]Task type: {task_type}[/]")
+                console.print(f"[info]Using default model (gemma3:12b)[/]\n")
+                
                 if is_multi:
-                    console.print(
-                        "[cyan]Detected MULTI-TASK → switching to multi-task pipeline[/]"
-                    )
-                    # Qui usi la pipeline multi-task (la stessa del batch)
-                    job_desc_result = generator.analyze_job(user_input)
-                    jd_text = job_desc_result["description"]
-                    tasks_data_raw = extract_multi_task_tags(jd_text)
-                    tasks_data = map_extractor_to_calculator(tasks_data_raw)
-                    calc_result = calc.compute_multi_task(
-                        tasks_data, job_description=user_input
-                    )
-                    ja_text = remove_tags(
-                        ja_gen.generate_multi_task_job_analysis(calc_result.as_dict())
-                    )
-                    ha_text = remove_tags(
-                        hz_gen.generate_multi_task_hazard_assessment(calc_result)
-                    )
-                    rs_text = remove_tags(
-                        rs_gen.generate_multi_task_redesign(calc_result)
-                    )
-                    # --- Save Report Logic ---
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    report_dir = Path("reports") / task_type
-                    report_dir.mkdir(parents=True, exist_ok=True)
-
-                    base_filename = f"niosh_multitask_{timestamp}"
-
-                    # 1. Construct Full Report (Markdown)
-                    full_report_md = f"# NIOSH Multi-Task Analysis Report\n\n"
-                    full_report_md += (
-                        f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-                    )
-                    full_report_md += f"**Job Description:** {jd_text}\n\n"
-                    full_report_md += f"## Job Analysis\n\n{ja_text}\n\n"
-                    full_report_md += f"## Hazard Assessment\n\n{ha_text}\n\n"
-                    full_report_md += f"## Redesign Suggestions\n\n{rs_text}\n\n"
-
-                    # 2. Clean Tags for Final Output (preserving newlines)
-                    # Remove [TAG:value] patterns
-                    clean_report_md = re.sub(
-                        r"\[[a-zA-Z0-9]+:[^\]]+\]", "", full_report_md
-                    )
-                    # Clean up multiple spaces but preserve newlines
-                    clean_report_md = re.sub(r"[ \t]+", " ", clean_report_md)
-
-                    # 3. Save Markdown File
-                    md_path = report_dir / f"{base_filename}.md"
-                    with open(md_path, "w", encoding="utf-8") as f:
-                        f.write(clean_report_md)
-
-                    # 4. Save JSON Data (Raw + Sections)
-                    json_data = {
-                        "timestamp": datetime.now().isoformat(),
-                        "input": user_input,
-                        "calculation_result": calc_result.as_dict(),
-                        "sections": {
-                            "job_description": jd_text,
-                            "job_analysis": ja_text,
-                            "hazard_assessment": ha_text,
-                            "redesign_suggestions": rs_text,
-                        },
-                    }
-
-                    json_path = report_dir / f"{base_filename}.json"
-                    with open(json_path, "w", encoding="utf-8") as f:
-                        json.dump(json_data, f, indent=2, ensure_ascii=False)
-
-                    # 5. User Feedback
-                    console.print(f"\n[success]Multi-task analysis completed![/]")
-                    console.print(f"[info]Report saved to: {md_path}[/]")
-                    console.print(f"[info]Data saved to: {json_path}[/]")
-
-                    # Show preview (clean)
-                    console.print("\n[bold]Report Preview:[/]\n")
-                    console.print(clean_report_md)
-                else:
-                    # Single-task normale
-                    generate_single_model_report(
+             
+                    console.print("[cyan]Using MULTI-TASK pipeline[/]")
+                    generate_multi_task_report_single_model(
                         user_input,
                         generator,
                         calc,
@@ -1593,43 +1829,96 @@ def interactive_chat():
                         rs_gen,
                         task_type=task_type,
                     )
+                else:
+                    # Single-task pipeline con fallback
+                    console.print("[cyan]Using SINGLE-TASK pipeline[/]")
+                    result = generate_single_model_report(
+                        user_input,
+                        generator,
+                        calc,
+                        ja_gen,
+                        hz_gen,
+                        rs_gen,
+                        task_type=task_type,
+                    )
+
+        
+                    if result == "MULTI_DETECTED":
+                        console.print(
+                            "[yellow]⚠ Multi-task detected during analysis![/]"
+                        )
+                        console.print("[info]Switching to MULTI-TASK pipeline...[/]")
+                        generate_multi_task_report_single_model(
+                            user_input,
+                            generator,
+                            calc,
+                            ja_gen,
+                            hz_gen,
+                            rs_gen,
+                            task_type="multi",
+                        )
+                    elif result is None:
+                        console.print("[yellow]⚠ Analysis failed, please try again[/]")
+
+            # Separator per nuova iterazione
+            console.print("\n[dim]" + "─" * 60 + "[/dim]\n")
 
         except KeyboardInterrupt:
-            print("\n\n Interruzione utente. Arrivederci!\n")
+            console.print("\n\n[yellow]⚠ Interruzione utente. Arrivederci![/]\n")
+            show_goodbye_message()
             break
         except Exception as e:
-            print(f"\n Errore: {e}\n")
+            console.print(f"\n[danger]✗ Errore imprevisto: {e}[/]\n")
+            import traceback
+            console.print("[dim]Stack trace:[/dim]")
+            traceback.print_exc()
+            console.print("\n[info]Il sistema è ancora attivo. Puoi continuare.[/]\n")
 
 
 def generate_reports_from_file(
     scenarios_file: str, num_examples: int = None, use_multi_model: bool = None
 ):
-    """Genera automaticamente report NIOSH da file di scenari
+    """
+    Genera automaticamente report NIOSH da file di scenari.
+    
+    VERSIONE CORRETTA con:
+    - Normalizzazione task_type corretta
+    - Gestione multi-task completa
+    - Success tracking accurato
+    - Error handling robusto
+    - Statistiche dettagliate
 
     Args:
         scenarios_file: Path to file containing job descriptions (one per line)
         num_examples: Number of scenarios to process (None = all)
-        use_multi_model: If True, generate reports with all models; if False, single model only; if None, ask user
+        use_multi_model: If True, generate reports with all models; 
+                        If False, single model only; 
+                        If None, ask user
     """
 
+    # ===================================================================
+    # VALIDAZIONE FILE
+    # ===================================================================
+    
     if not os.path.exists(scenarios_file):
-        console.print(f"[danger]ERROR: File {scenarios_file} non trovato[/]")
+        console.print(f"[danger]✗ ERROR: File '{scenarios_file}' not found[/]")
         return
 
-    # Ask for model selection if not specified
+    # ===================================================================
+    # MODEL SELECTION
+    # ===================================================================
+    
     if use_multi_model is None:
+        console.print(f"\n[bold cyan]SELECT MODEL MODE FOR BATCH PROCESSING[/bold cyan]")
+        console.print("[info]Choose how you want to generate the analysis reports:[/]\n")
         console.print(
-            f"\n[bold cyan]SELECT MODEL MODE FOR BATCH PROCESSING[/bold cyan]"
+            "1. [green]Single Model[/green] - Use only gemma3:12b (Ollama)"
         )
+        console.print("   Faster processing with single model output\n")
         console.print(
-            "[info]Choose how you want to generate the analysis reports:[/]\n"
+            "2. [yellow]Multi-Model[/yellow] - Generate reports with all available models"
         )
-        console.print(
-            "1. [green]Single Model[/green] - Use only gemma3:12b (Ollama) - Faster processing"
-        )
-        console.print(
-            "2. [yellow]Multi-Model[/yellow] - Generate reports with all available models - Slower but comprehensive\n"
-        )
+        console.print("   Slower but comprehensive (gemma3, llama3.2, llama3.1, gemini)\n")
 
         while True:
             choice = console.input("[info]Select mode (1-2): [/]").strip()
@@ -1640,59 +1929,115 @@ def generate_reports_from_file(
                 use_multi_model = True
                 break
             else:
-                console.print("[danger]Invalid choice. Please select 1-2.[/]")
+                console.print("[danger]Invalid choice. Please select 1 or 2.[/]")
 
         mode_text = "Multi-Model Mode" if use_multi_model else "Single Model Mode"
-        console.print(f"[info]Selected: {mode_text}[/]\n")
+        console.print(f"[info]✓ Selected: {mode_text}[/]\n")
 
-    console.print(f"[info]Reading scenarios from {scenarios_file}...[/]")
+    # ===================================================================
+    # LETTURA FILE E PREPROCESSING
+    # ===================================================================
+    
+    console.print(f"[info]Reading scenarios from '{scenarios_file}'...[/]")
 
     try:
         with open(scenarios_file, "r", encoding="utf-8") as f:
             lines = [line.strip() for line in f.readlines() if line.strip()]
 
-        # Filtra solo le righe che sembrano descrizioni di task (non vuote, non commenti)
+        # Filtra righe valide (non commenti, lunghezza minima)
         scenarios = [
-            line for line in lines if not line.startswith("#") and len(line) > 10
+            line for line in lines 
+            if not line.startswith("#") and len(line) > 10
         ]
+
+        if not scenarios:
+            console.print("[yellow]⚠ Warning: No valid scenarios found in file[/]")
+            return
 
         if num_examples:
             scenarios = scenarios[:num_examples]
+            console.print(
+                f"[info]✓ Found {len(lines)} scenarios, processing first {num_examples}[/]"
+            )
+        else:
+            console.print(f"[info]✓ Found {len(scenarios)} scenarios to analyze[/]")
 
-        console.print(f"[info]Found {len(scenarios)} scenarios to analyze[/]")
+    except Exception as e:
+        console.print(f"[danger]✗ ERROR: Error reading file: {e}[/]")
+        import traceback
+        traceback.print_exc()
+        return
 
-        # Initialize components (standard mode)
+    # ===================================================================
+    # INIZIALIZZAZIONE COMPONENTS
+    # ===================================================================
+    
+    console.print("\n[info]Initializing NIOSH analysis components...[/]")
+    try:
         generator = NIOSHJobDescriptionGenerator()
         calc = NIOSHCalculator()
         ja_gen = NIOSHJobAnalysisGenerator()
         hz_gen = NIOSHHazardAssessmentGenerator()
         rs_gen = NIOSHRedesignSuggestionsGenerator()
+        console.print("[success]✓ All components initialized[/]")
+    except Exception as e:
+        console.print(f"[danger]✗ ERROR: Failed to initialize components: {e}[/]")
+        return
 
-        os.makedirs("report", exist_ok=True)
-        success_count = 0
-        error_count = 0
+    os.makedirs("report", exist_ok=True)
 
-        for i, scenario in enumerate(scenarios, 1):
-            try:
+    # ===================================================================
+    # STATISTICHE PROCESSING
+    # ===================================================================
+    
+    stats = {
+        "success": 0,
+        "failed": 0,
+        "single_task": 0,
+        "multi_task": 0,
+        "repetitive_task": 0,
+    }
+
+    console.print("\n[bold green]═══════════════════════════════════════[/]")
+    console.print("[bold green]   STARTING BATCH PROCESSING[/]")
+    console.print("[bold green]═══════════════════════════════════════[/]\n")
+
+    # ===================================================================
+    # MAIN PROCESSING LOOP
+    # ===================================================================
+    
+    for i, scenario in enumerate(scenarios, 1):
+        try:
+            console.print(f"\n[cyan]━━━ Scenario {i}/{len(scenarios)} ━━━[/cyan]")
+            console.print(f"[info]Text: {scenario[:70]}{'...' if len(scenario) > 70 else ''}[/]")
+
+            #  Classificazione task type
+            task_type = classify_sentence(scenario)
+            console.print(f"[info]Detected type: [bold]{task_type}[/]")
+
+            # Normalizzazione di task_type
+            original_task_type = task_type
+            if task_type == "repetitive":
                 console.print(
-                    f"\n[info]Processing scenario {i}/{len(scenarios)}: {scenario[:50]}...[/]"
+                    "[info]Repetitive task → using SINGLE-TASK RNLE (per NIOSH guidelines)"
                 )
+                task_type = "single" 
+                stats["repetitive_task"] += 1
+            
+            # Traccia statistiche per tipo
+            if task_type == "multi":
+                stats["multi_task"] += 1
+            elif task_type == "single":
+                stats["single_task"] += 1
 
-                # Classify task type
-                task_type = classify_sentence(scenario)
-                console.print(f"[info]Detected task type: [bold]{task_type}[/]")
-
-                if task_type == "repetitive":
-                    console.print(
-                        "[info]Repetitive task detected → treating as SINGLE-TASK (RNLE rule)"
-                    )
-                    # Keep task_type as "repetitive" for folder organization
-
-                if use_multi_model:
-                    # Multi-model mode: generate reports with all available models
-                    console.print(
-                        f"[cyan]Multi-Model processing for scenario {i}...[/]"
-                    )
+            # ===================================================================
+            # PROCESSING: MULTI-MODEL MODE
+            # ===================================================================
+            
+            if use_multi_model:
+                console.print(f"[cyan]→ Multi-Model processing...[/]")
+                
+                try:
                     generate_multi_model_reports(
                         scenario,
                         generator,
@@ -1702,53 +2047,133 @@ def generate_reports_from_file(
                         rs_gen,
                         task_type=task_type,
                     )
-                    success_count += 1
-                else:
-                    # Single model mode: original behavior with comprehensive report
-                    console.print(
-                        f"[info]Single-Model processing for scenario {i}...[/]"
-                    )
-                    generate_single_model_report(
-                        scenario,
-                        generator,
-                        calc,
-                        ja_gen,
-                        hz_gen,
-                        rs_gen,
-                        auto_save=True,
-                        task_type=task_type,
-                    )
-                    success_count += 1
+                    stats["success"] += 1
+                    console.print(f"[green]✓ Scenario {i} completed (multi-model)[/]")
+                    
+                except Exception as e:
+                    stats["failed"] += 1
+                    console.print(f"[red]✗ Scenario {i} failed: {e}[/]")
+                    import traceback
+                    console.print("[dim]" + traceback.format_exc() + "[/dim]")
 
-            except Exception as e:
-                console.print(f"[danger]ERROR: Error processing scenario {i}: {e}[/]")
-                error_count += 1
-                continue
+            # ===================================================================
+            # PROCESSING: SINGLE-MODEL MODE
+            # ===================================================================
+            
+            else:
+                console.print(f"[cyan]→ Single-Model processing...[/]")
+                
+                try:
+                    #  multi-task
+                    if task_type == "multi":
+                        # Multi-task pipeline
+                        console.print("[info]Using MULTI-TASK pipeline[/]")
+                        generate_multi_task_report_single_model(
+                            scenario,
+                            generator,
+                            calc,
+                            ja_gen,
+                            hz_gen,
+                            rs_gen,
+                            task_type=task_type,
+                        )
+                    else:
+                        # Single-task pipeline
+                        console.print("[info]Using SINGLE-TASK pipeline[/]")
+                        result = generate_single_model_report(
+                            scenario,
+                            generator,
+                            calc,
+                            ja_gen,
+                            hz_gen,
+                            rs_gen,
+                            auto_save=True,
+                            task_type=task_type,
+                        )
+                        
+                        #  Gestione fallback MULTI_DETECTED
+                        if result == "MULTI_DETECTED":
+                            console.print("[yellow]⚠ Multi-task detected during analysis[/]")
+                            console.print("[info]Switching to MULTI-TASK pipeline...[/]")
+                            generate_multi_task_report_single_model(
+                                scenario,
+                                generator,
+                                calc,
+                                ja_gen,
+                                hz_gen,
+                                rs_gen,
+                                task_type="multi",
+                            )
+                            stats["multi_task"] += 1
+                            stats["single_task"] -= 1  # Correggi conteggio
+                        elif result is None:
+                            raise Exception("Analysis returned None")
+                    
+                    # Success count SOLO se completato con successo
+                    stats["success"] += 1
+                    console.print(f"[green]✓ Scenario {i} completed (single-model)[/]")
+                    
+                except Exception as e:
+                    stats["failed"] += 1
+                    console.print(f"[red]✗ Scenario {i} failed: {e}[/]")
+                    import traceback
+                    console.print("[dim]" + traceback.format_exc() + "[/dim]")
 
-        console.print(f"\n[success]Report generation completed![/]")
-        console.print(
-            f"[info]Mode used: {'Multi-Model' if use_multi_model else 'Single Model'}[/]"
-        )
-        console.print(f"[info]Successfully processed scenarios: {success_count}[/]")
-        console.print(f"[info]Scenarios with errors: {error_count}[/]")
+        except Exception as e:
+            # Catch-all per errori imprevisti
+            stats["failed"] += 1
+            console.print(f"[red]✗ Scenario {i} - Unexpected error: {e}[/]")
+            import traceback
+            console.print("[dim]" + traceback.format_exc() + "[/dim]")
+            continue
 
-        if use_multi_model:
-            console.print(
-                f"[info]Each scenario generated reports with all available models[/]"
-            )
-            console.print(
-                f"[info]Check 'report/' directory for model-specific files (gemma3-12b_*, llama3.2_*, llama3.1-8b_*, gemini-2.5_*)[/]"
-            )
-        else:
-            console.print(
-                f"[info]Each scenario generated comprehensive single-model reports[/]"
-            )
-            console.print(
-                f"[info]Check 'report/' directory for niosh_single_*.json/md files[/]"
-            )
+    # ===================================================================
+    # SUMMARY FINALE
+    # ===================================================================
+    
+    console.print("\n[bold green]═══════════════════════════════════════[/]")
+    console.print("[bold green]   BATCH PROCESSING COMPLETE[/]")
+    console.print("[bold green]═══════════════════════════════════════[/]\n")
 
-    except Exception as e:
-        console.print(f"[danger]ERROR: Error reading file: {e}[/]")
+    # Statistiche generali
+    console.print(f"[info]Mode used: {'Multi-Model' if use_multi_model else 'Single Model'}[/]")
+    console.print(f"[success]✓ Successfully processed: {stats['success']}/{len(scenarios)}[/]")
+    
+    if stats["failed"] > 0:
+        console.print(f"[yellow]✗ Failed scenarios: {stats['failed']}/{len(scenarios)}[/]")
+    
+    # Statistiche per tipo
+    console.print(f"\n[bold]Task Type Breakdown:[/]")
+    console.print(f"  • Single-task: {stats['single_task']}")
+    console.print(f"  • Multi-task: {stats['multi_task']}")
+    console.print(f"  • Repetitive (→single): {stats['repetitive_task']}")
+
+    # Info sui file generati
+    console.print(f"\n[bold]Output Location:[/]")
+    if use_multi_model:
+        console.print(f"  • Each scenario generated reports with all available models")
+        console.print(f"  • Check 'report/' directory for model-specific files:")
+        console.print(f"    - gemma3-12b_report_*.json/md")
+        console.print(f"    - llama3.2_report_*.json/md")
+        console.print(f"    - llama3.1-8b_report_*.json/md")
+        console.print(f"    - gemini-2.5_report_*.json/md (if available)")
+    else:
+        console.print(f"  • Each scenario generated comprehensive single-model reports")
+        console.print(f"  • Check 'report/' directory for:")
+        console.print(f"    - niosh_single_*.json/md (single-task)")
+        console.print(f"    - niosh_multitask_*.json/md (multi-task)")
+
+    # Success rate
+    success_rate = (stats["success"] / len(scenarios) * 100) if len(scenarios) > 0 else 0
+    console.print(f"\n[bold]Success Rate: {success_rate:.1f}%[/]")
+    
+    if success_rate == 100:
+        console.print("[green]🎉 All scenarios processed successfully![/]")
+    elif success_rate >= 80:
+        console.print("[yellow]⚠ Most scenarios processed, check failed ones[/]")
+    else:
+        console.print("[red]⚠ Many failures detected, review errors above[/]")
+
 
 
 def batch_process(inputs: List[str]):

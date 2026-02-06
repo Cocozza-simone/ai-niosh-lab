@@ -74,6 +74,51 @@ class NIOSHHazardAssessmentGenerator:
         self.model = model
 
     # ---------- PROMPT DI SISTEMA ----------
+        # ---------- FEW-SHOT PROVIDER FOR GEMINI JUDGE ----------
+    def get_reference_examples(self, task_type: str) -> str:
+        """
+        Restituisce i few-shot corretti da usare per il Gemini Judge
+        in base alla categoria del task (single / repetitive / multi).
+        """
+
+        # --- SINGLE-TASK (default) ---
+        single_example = """
+EXAMPLE — HAZARD ASSESSMENT (NIOSH Applications Manual)
+
+"The weight to be lifted is 44 lbs [W:44], which exceeds the RWL at both the
+origin (16.3 lbs [RWL0:16.3]) and destination (14.5 lbs [RWL1:14.5]). As a result,
+the LI is 2.7 at the origin [LI0:2.7] and 3.0 at the destination [LI1:3.0], both
+well above the design guideline of 1.0. These values indicate that this lift would
+be hazardous for most healthy workers [CTRL:true]."
+"""
+
+        # --- REPETITIVE SINGLE-TASK ---
+        repetitive_example = """
+EXAMPLE — REPETITIVE HAZARD ASSESSMENT
+
+"For this repetitive lifting task, the weight of 26 lbs [W:26] exceeds the
+reduced RWL at the origin (17.4 lbs [RWL0:17.4]) due to the effect of the
+Frequency Multiplier. The resulting LI of 1.49 [LI0:1.49] indicates increased
+physiological strain under sustained repetition. Even when LI is near 1.0,
+repetitive lifting magnifies cumulative fatigue and increases the risk of injury."
+"""
+
+        # --- MULTI-TASK ---
+        multi_example = """
+EXAMPLE — MULTI-TASK HAZARD ASSESSMENT
+
+"Across the job’s multiple lifting tasks, individual LIs range from 1.25 [LIi:1.25]
+to 1.51 [LIi:1.51], each exceeding the RNLE design goal of 1.0. When evaluated
+together, the Composite Lifting Index is 2.3 [CLI:2.3], indicating that the job is
+physically stressful for many workers over the shift [DUR:2-8h]."
+"""
+
+        if task_type == "repetitive":
+            return repetitive_example
+        elif task_type == "multi":
+            return multi_example
+        else:
+            return single_example
 
     def _create_system_prompt(self) -> str:
         return """
@@ -384,11 +429,45 @@ treat all LIi and CLI values as fixed, precomputed inputs from Python (no recomp
     def generate_multi_task_hazard_assessment(self, calc_result) -> str:
         """
         Genera la HAZARD ASSESSMENT multi-task usando SOLO i valori calcolati
-        da Python (LIi, RWLi, CLI). Nessuna ricomputazione.
+        da Python (LIi, RWLi, CLI). Nessuna ricomputazione. Nessuna modifica
+        dei numeri. Nessuna reinterpretazione della RNLE.
+        Accetta sia un MultiTaskCalculationResult sia un dict e li normalizza.
         """
 
         # ---------------------------------------------------------
-        # FEW-SHOT MULTI-TASK HAZARD EXAMPLE (DA INSERIRE NEL USER PROMPT)
+        # NORMALIZZAZIONE INPUT (accetta dict oppure oggetto)
+        # ---------------------------------------------------------
+        if isinstance(calc_result, dict):
+
+            # adapter minimale per sicurezza
+            class _T:
+                def __init__(self, d):
+                    self.task_id = d.get("task_id") or d.get("task") or 0
+                    self.weight_lbs = float(d["weight"])
+                    self.horizontal_origin = float(d["horizontal_origin"])
+                    self.horizontal_destination = float(d["horizontal_destination"])
+                    self.vertical_origin = float(d["vertical_origin"])
+                    self.vertical_destination = float(d["vertical_destination"])
+                    self.asymmetry_angle = float(d["asymmetry_angle"])
+                    self.frequency_lifts_per_min = float(d["frequency"])
+                    self.coupling = d["coupling"]
+                    self.strwl_lbs = float(d["strwl_lbs"])
+                    self.stli = float(d["stli"])
+
+            class _C:
+                pass
+
+            c = _C()
+            c.job_description = calc_result.get("job_description", "")
+            c.cli = float(calc_result.get("cli", 0.0))
+            c.risk_category = calc_result.get("risk_category", "")
+            c.duration = calc_result.get("duration", "2-8h")
+            c.tasks = [_T(td) for td in calc_result.get("tasks", [])]
+
+            calc_result = c
+
+        # ---------------------------------------------------------
+        # FEW-SHOT MULTI-TASK CORRETTO (NIOSH-STYLE)
         # ---------------------------------------------------------
         fewshot = """
     ASSISTANT EXAMPLE — MULTI-TASK HAZARD ASSESSMENT (STYLE TO IMITATE)
@@ -408,14 +487,14 @@ treat all LIi and CLI values as fixed, precomputed inputs from Python (no recomp
 
     Although each task individually exceeds the RNLE design goal of LI = 1.0,
     their combined effect is best represented by the Composite Lifting Index.
-    When evaluated together, the overall job yields a CLI of 2.3 [CLI:2.3].
+    When evaluated together, the overall job yields a CLI of 2.3 [CLI:2.3]. 
     According to NIOSH guidance, a CLI between 1.0 and 3.0 indicates a job that is
     physically stressful for many workers over the work period [DUR:2-8h], even
     when individual tasks may appear marginally acceptable on their own."
     """
 
         # ---------------------------------------------------------
-        # COSTRUZIONE BLOCCO TASK (DA VALORI CALCOLATI)
+        # COSTRUZIONE BLOCCHI TASK (TUTTI TAG REALI)
         # ---------------------------------------------------------
         tasks_block = []
         for t in calc_result.tasks:
@@ -436,12 +515,12 @@ treat all LIi and CLI values as fixed, precomputed inputs from Python (no recomp
         tasks_block_str = "\n".join(tasks_block)
 
         # ---------------------------------------------------------
-        # DURATA (default se mancante)
+        # DURATA (default sicuro)
         # ---------------------------------------------------------
         duration = getattr(calc_result, "duration", "2-8h")
 
         # ---------------------------------------------------------
-        # USER PROMPT COMPLETO (CON FEW-SHOT)
+        # USER PROMPT NIOSH-FORMATTED (DETERMINISTICO)
         # ---------------------------------------------------------
         user_prompt = f"""
     FEW-SHOT EXAMPLE (IMITATE THIS EXACT STYLE):
@@ -463,11 +542,11 @@ treat all LIi and CLI values as fixed, precomputed inputs from Python (no recomp
     INSTRUCTIONS:
     Write the MULTI-TASK HAZARD ASSESSMENT:
 
-    • Follow the structure of NIOSH Examples 7–8: 
-    Intro → Task descriptions with tags → CLI interpretation.
+    • Follow exactly the structure of NIOSH Examples 7–8:
+    Intro → Task interpretations with tags → CLI interpretation.
 
-    • Use ONLY the values provided above.
-    • NEVER recompute LIi or CLI.
+    • Use ONLY the values provided.
+    • DO NOT recompute LIi, RWLi, or CLI.
     • ALL tags MUST appear inline exactly once per referenced value.
     • Interpret CLI as:
         - CLI < 1.0 → "acceptable for nearly all workers"
@@ -478,7 +557,7 @@ treat all LIi and CLI values as fixed, precomputed inputs from Python (no recomp
     """
 
         # ---------------------------------------------------------
-        # CHIAMATA AL MODELLO
+        # CHIAMATA MODELLO
         # ---------------------------------------------------------
         try:
             response = ollama.chat(
@@ -486,7 +565,10 @@ treat all LIi and CLI values as fixed, precomputed inputs from Python (no recomp
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are an expert in NIOSH MULTI-TASK hazard assessment. Follow all rules precisely.",
+                        "content": (
+                            "You are an expert in NIOSH multi-task hazard assessment. "
+                            "Follow ALL RNLE rules exactly. NEVER change numbers."
+                        ),
                     },
                     {"role": "user", "content": user_prompt},
                 ],
@@ -495,3 +577,168 @@ treat all LIi and CLI values as fixed, precomputed inputs from Python (no recomp
 
         except Exception as e:
             return f"Errore generazione hazard multi-task: {e}"
+
+    def generate_dual_hazard_assessment(self, data: HazardAssessmentInput, task_type: str):
+        """
+        Restituisce due versioni della Hazard Assessment:
+        - ha_specific: generata normalmente rispettando task_type
+        - ha_combined: generata usando TUTTI i few-shot insieme (single + repetitive + multi)
+        """
+
+        # 1) Versione specifica (standard)
+        ha_specific = self.generate_hazard_assessment(data, task_type)
+
+        # 2) Costruzione few-shot combinato
+        full_fewshot = (
+            self.get_reference_examples("single")
+            + "\n\n"
+            + self.get_reference_examples("repetitive")
+            + "\n\n"
+            + self.get_reference_examples("multi")
+        )
+
+        # Build prompt combinato
+        user_prompt = f"""
+STYLE REFERENCES (ALL NIOSH HAZARD ASSESSMENT EXAMPLES COMBINED):
+{full_fewshot}
+
+NOW GENERATE A NEW HAZARD ASSESSMENT BASED ON THE FOLLOWING FIXED VALUES:
+
+Weight = {data.weight_lbs} lbs
+RWL Origin = {data.rwl_origin_lbs}
+LI Origin = {data.li_origin}
+
+RWL Destination = {data.rwl_dest_lbs}
+LI Destination = {data.li_dest}
+
+Significant control = {data.significant_control}
+
+Task description (context only):
+{data.task_description}
+
+IMPORTANT RULES:
+- Do NOT modify any numeric value.
+- Produce a SINGLE PARAGRAPH.
+- Use the FULL manifold style learned from all examples.
+- Still respect task_type = "{task_type}".
+"""
+
+        ha_combined = ollama.chat(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert in NIOSH Hazard Assessment. "
+                        "Use ONLY provided numbers. NEVER invent values. "
+                        "Follow NIOSH Applications Manual style."
+                    ),
+                },
+                {"role": "user", "content": user_prompt},
+            ],
+        )["message"]["content"].strip()
+
+        return {
+            "ha_specific": ha_specific,
+            "ha_combined": ha_combined,
+        }
+
+    def generate_multi_task_dual_hazard_assessment(self, calc_result, task_type: str = "multi"):
+        """
+        Restituisce due versioni della Hazard Assessment MULTI-TASK:
+        - ha_specific: generata con il few-shot MULTI standard
+        - ha_combined: generata usando TUTTI i few-shot (single + repetitive + multi)
+        """
+
+        # ----------------------------------------------------
+        # 1) VERSIONE SPECIFICA (standard multi-task)
+        # ----------------------------------------------------
+        ha_specific = self.generate_multi_task_hazard_assessment(calc_result)
+
+        # ----------------------------------------------------
+        # 2) COSTRUZIONE FEW-SHOT COMBINATO (manifold completo)
+        # ----------------------------------------------------
+        full_fewshot = (
+            "\n\n--- SINGLE-TASK HAZARD EXAMPLE ---\n"
+            + self.get_reference_examples("single")
+            + "\n\n--- REPETITIVE-TASK HAZARD EXAMPLE ---\n"
+            + self.get_reference_examples("repetitive")
+            + "\n\n--- MULTI-TASK HAZARD EXAMPLE ---\n"
+            + self.get_reference_examples("multi")
+        )
+
+        # Costruzione blocchi task con TAG esattamente come richiesto
+        tasks_block = []
+        for t in calc_result.tasks:
+            tasks_block.append(
+                f"[TASK:{t.task_id}] "
+                f"[Wi:{t.weight_lbs}] "
+                f"[H0i:{t.horizontal_origin}] "
+                f"[H1i:{t.horizontal_destination}] "
+                f"[V0i:{t.vertical_origin}] "
+                f"[V1i:{t.vertical_destination}] "
+                f"[Ai:{t.asymmetry_angle}] "
+                f"[Fi:{t.frequency_lifts_per_min}] "
+                f"[RWLi:{t.strwl_lbs}] "
+                f"[LIi:{t.stli}] "
+                f"[COUPi:{t.coupling}]"
+            )
+
+        tasks_block_str = "\n".join(tasks_block)
+        duration = getattr(calc_result, "duration", "2-8h")
+
+        # ----------------------------------------------------
+        # 3) USER PROMPT PER VERSIONE COMBINATA
+        # ----------------------------------------------------
+        user_prompt = f"""
+    STYLE REFERENCES – FULL MULTI-TASK HAZARD MANIFOLD:
+    {full_fewshot}
+
+    NOW GENERATE A NEW MULTI-TASK HAZARD ASSESSMENT.
+
+    RULES:
+    - You MUST obey task_type="multi".
+    - NEVER modify any numerical value.
+    - Use ALL styles (single + repetitive + multi) to shape the narrative.
+    - Include ALL TAGS exactly once per referenced value.
+    - Interpret CLI according to RNLE.
+
+    JOB DESCRIPTION (context only):
+    {calc_result.job_description}
+
+    Composite Lifting Index:
+    CLI = {calc_result.cli} [CLI:{calc_result.cli}]
+    Risk category: {calc_result.risk_category}
+    Duration: [DUR:{duration}]
+
+    TASK DATA (MUST NOT BE ALTERED):
+    {tasks_block_str}
+    """
+
+        # ----------------------------------------------------
+        # 4) SYSTEM PROMPT (coerente con dual single-task)
+        # ----------------------------------------------------
+        system_prompt = (
+            "You are an expert in NIOSH Multi-Task Hazard Assessment. "
+            "Use ONLY provided numbers. NEVER invent values. "
+            "Follow NIOSH Applications Manual style exactly."
+        )
+
+        # ----------------------------------------------------
+        # 5) GENERAZIONE VERSIONE COMBINATA – stile identico al dual single-task
+        # ----------------------------------------------------
+        ha_combined = ollama.chat(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )["message"]["content"].strip()
+
+        # ----------------------------------------------------
+        # 6) RETURN IDENTICO AL TUO generate_dual_hazard_assessment
+        # ----------------------------------------------------
+        return {
+            "ha_specific": ha_specific,
+            "ha_combined": ha_combined,
+        }

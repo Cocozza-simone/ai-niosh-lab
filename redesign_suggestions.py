@@ -92,6 +92,57 @@ class NIOSHRedesignSuggestionsGenerator:
 
     def __init__(self, model: str = "gemma3:12b"):
         self.model = model
+        # ---------- FEW-SHOT PROVIDER FOR GEMINI JUDGE ----------
+
+    def get_reference_examples(self, task_type: str) -> str:
+        """
+        Restituisce i few-shot corretti da usare come riferimento per
+        la valutazione Gemini Judge della sezione Redesign Suggestions.
+        I few-shot corrispondono ai manifold di stile previsti dal manuale NIOSH.
+        """
+
+        # --- SINGLE-TASK (default) ---
+        single_example = """
+EXAMPLE — REDESIGN SUGGESTIONS (NIOSH single-task)
+
+"The horizontal reach of 18 inches [H0:18] and 14 inches [H1:14] represents the
+largest penalty through the Horizontal Multiplier (HM). Reducing horizontal reach
+toward the torso would increase HM and therefore increase the RWL, lowering the LI.
+Adjusting the vertical height toward the optimal zone near 30 inches would similarly
+improve VM and reduce task stress. Because coupling is fair [COUP:fair], improving
+hand-to-object coupling would increase CM and further reduce the physical demand."
+"""
+
+        # --- REPETITIVE SINGLE-TASK ---
+        repetitive_example = """
+EXAMPLE — REDESIGN SUGGESTIONS (NIOSH repetitive lifting)
+
+"Because this lift is performed repetitively at 3 lifts/min [F:3] for <1h [DUR:<1h],
+the Frequency Multiplier (FM) is a primary limiting factor. Reducing lifting
+frequency, alternating tasks, or incorporating micro-breaks would increase FM
+and reduce cumulative loading. Reducing horizontal reach and improving coupling
+would increase HM and CM respectively, providing additional reductions in LI."
+"""
+
+        # --- MULTI-TASK ---
+        multi_example = """
+EXAMPLE — MULTI-TASK REDESIGN (NIOSH Examples 7–8)
+
+"In this multi-task job, the highest LI values occur in Task 3 [LI3:1.7] and Task 4
+[LI4:2.4], which dominate the Composite Lifting Index of 2.9 [CLI:2.9]. Redesign
+efforts should prioritize reductions in horizontal reach (improving HM), improving
+coupling (increasing CM), and reducing asymmetry (increasing AM) for these tasks.
+Where feasible, lowering lifting frequency would improve FM and reduce cumulative
+exposure. These improvements would shift the CLI closer to the RNLE design goal
+of 1.0."
+"""
+
+        if task_type == "repetitive":
+            return repetitive_example
+        elif task_type == "multi":
+            return multi_example
+        else:
+            return single_example
 
     # ---------- UTILITY PER FORMATTARE I MOLTIPLICATORI CRITICI ----------
 
@@ -267,7 +318,7 @@ class NIOSHRedesignSuggestionsGenerator:
 
     # ---------- PROMPT DI SISTEMA ----------
 
-        # ---------- PROMPT DI SISTEMA ----------
+    # ---------- PROMPT DI SISTEMA ----------
 
     def _create_system_prompt(self, task_type: str | None = None) -> str:
         task_lock = f"""
@@ -317,7 +368,6 @@ MANDATORY RULES
    - Reducing frequency/duration increases FM.
 7. NEVER recompute formulas. NEVER invent new multipliers.
 """
-
 
     # ---------- PROMPT UTENTE (DATI) ----------
     def _create_system_prompt_multi_task(self) -> str:
@@ -524,10 +574,6 @@ TASK SCENARIO (for context only, do NOT change it):
     Using ONLY the information above, write the REDESIGN SUGGESTIONS section in the style of
     the NIOSH Applications Manual.
     """
-
-    # ---------- CHIAMATA A OLLAMA ----------
-
-        # ---------- CHIAMATA A OLLAMA ----------
 
     def generate_redesign_suggestions(
         self,
@@ -813,3 +859,193 @@ RWL_new = 51 × HM_new × VM_new × DM_new × AM_new × FM_new × CM_new = {impr
 LI_new = {original_data.weight_lbs:.1f} / {improved["new_rwl"]:.1f} = {improved["new_li"]:.2f}
 
 This represents a {improved["improvement_percentage"]:.1f}% improvement in the lifting index at the origin, moving the task closer to the design goal of LI = 1.0."""
+    
+    def generate_dual_redesign_suggestions(
+        self,
+        data: RedesignSuggestionsInput,
+        task_type: str
+    ):
+        """
+        Restituisce:
+        - rs_specific → versione standard, basata solo sul few-shot specifico
+        - rs_combined → versione combinata, basata su TUTTI i few-shot insieme
+        """
+
+        # 1) Versione SPECIFICA
+        rs_specific = self.generate_redesign_suggestions(data, task_type)
+
+        # 2) Costruzione few-shot combinato (single + repetitive + multi)
+        full_fewshot = (
+            self.get_reference_examples("single")
+            + "\n\n"
+            + self.get_reference_examples("repetitive")
+            + "\n\n"
+            + self.get_reference_examples("multi")
+        )
+
+        # Prompt COMBINATO
+        user_prompt = f"""
+STYLE REFERENCES (COMBINED NIOSH REDESIGN EXAMPLES):
+{full_fewshot}
+
+NOW GENERATE A NEW REDESIGN SUGGESTIONS SECTION
+USING THE FULL RNLE MANIFOLD STYLE,
+BUT RESPECTING task_type = "{task_type}"
+
+You MUST:
+- Never modify numbers.
+- Use ONLY values provided in this structured input.
+- Produce a formal NIOSH redesign narrative (1–2 paragraphs).
+- Link redesign ideas ONLY to correct multipliers (HM, VM, DM, AM, FM, CM).
+
+Input parameters (must NOT be changed):
+Weight = {data.weight_lbs}
+H0 = {data.h_origin}
+H1 = {data.h_dest}
+V0 = {data.v_origin}
+V1 = {data.v_dest}
+A0 = {data.a_origin}
+A1 = {data.a_dest}
+Frequency = {data.frequency_lifts_per_min}
+Duration = {data.duration_class}
+Coupling = {data.coupling}
+Significant control = {data.significant_control}
+
+RWL origin = {data.rwl_origin_lbs}
+RWL destination = {data.rwl_dest_lbs}
+LI origin = {data.li_origin}
+LI destination = {data.li_dest}
+
+Smallest multipliers (origin): {data.multipliers_origin}
+Smallest multipliers (destination): {data.multipliers_destination}
+
+Task description:
+{data.task_description}
+"""
+
+        # Chiamata modello (senza structured output)
+        rs_combined_response = ollama.chat(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert in NIOSH redesign suggestions "
+                        "and MUST follow Applications Manual style."
+                    ),
+                },
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+
+        rs_combined = rs_combined_response["message"]["content"].strip()
+
+        return {
+            "rs_specific": rs_specific,
+            "rs_combined": rs_combined,
+        }
+
+    
+    def generate_multi_task_dual_redesign_suggestions(self, calc_result, task_type: str = "multi"):
+        """
+        Restituisce due versioni della REDESIGN MULTI-TASK:
+        - rs_specific → uscita standard da generate_multi_task_redesign()
+        - rs_combined → generata usando TUTTI i few-shot (single + repetitive + multi)
+        """
+
+        # ----------------------------------------------------
+        # 1) VERSIONE SPECIFICA (standard NIOSH multi-task)
+        # ----------------------------------------------------
+        rs_specific = self.generate_multi_task_redesign(calc_result)
+
+        # ----------------------------------------------------
+        # 2) COSTRUZIONE FEW-SHOT COMBINATO (manifold completo)
+        # ----------------------------------------------------
+        full_fewshot = (
+            "\n\n--- SINGLE-TASK REDESIGN EXAMPLE ---\n"
+            + self.get_reference_examples("single")
+            + "\n\n--- REPETITIVE-TASK REDESIGN EXAMPLE ---\n"
+            + self.get_reference_examples("repetitive")
+            + "\n\n--- MULTI-TASK REDESIGN EXAMPLE ---\n"
+            + self.get_reference_examples("multi")
+        )
+
+        # ----------------------------------------------------
+        # 3) RICOSTRUZIONE BLOCCO TASK PER IL PROMPT COMBINATO
+        # ----------------------------------------------------
+        tasks_block = []
+        for t in calc_result.tasks:
+            tasks_block.append(
+                f"[TASK:{t.task_id}] "
+                f"[Wi:{t.weight_lbs}] "
+                f"[H0i:{t.horizontal_origin}] "
+                f"[H1i:{t.horizontal_destination}] "
+                f"[V0i:{t.vertical_origin}] "
+                f"[V1i:{t.vertical_destination}] "
+                f"[Ai:{t.asymmetry_angle}] "
+                f"[Fi:{t.frequency_lifts_per_min}] "
+                f"[RWLi:{t.strwl_lbs}] "
+                f"[LIi:{t.stli}] "
+                f"[COUPi:{t.coupling}]"
+            )
+
+        tasks_block_str = "\n".join(tasks_block)
+        duration = getattr(calc_result, "duration", "2-8h")
+
+        # ----------------------------------------------------
+        # 4) PROMPT UTENTE PER LA VERSIONE COMBINATA
+        # ----------------------------------------------------
+        user_prompt = f"""
+    STYLE REFERENCES — FULL NIOSH REDESIGN MANIFOLD:
+    {full_fewshot}
+
+    NOW GENERATE A NEW MULTI-TASK REDESIGN SUGGESTIONS SECTION,
+    USING THE FULL RNLE MANIFOLD STYLE,
+    BUT RESPECTING task_type = "{task_type}" (LOCKED).
+
+    RULES:
+    - NEVER change numerical values.
+    - ALWAYS reference task-specific LIi and RWLi exactly.
+    - Use multi-task logic: highest LI tasks dominate redesign.
+    - Use conceptual multiplier logic ONLY (HM, VM, DM, AM, FM, CM).
+    - Produce 1–2 formal NIOSH technical paragraphs.
+
+    JOB DESCRIPTION (context only):
+    {calc_result.job_description}
+
+    Composite Lifting Index:
+    CLI = {calc_result.cli} [CLI:{calc_result.cli}]
+    Risk category: {calc_result.risk_category}
+    Duration: [DUR:{duration}]
+
+    TASK DETAILS (MUST NOT BE ALTERED):
+    {tasks_block_str}
+    """
+
+        # ----------------------------------------------------
+        # 5) SYSTEM PROMPT PER IL COMBINED
+        # ----------------------------------------------------
+        system_prompt = (
+            "You are an expert in NIOSH multi-task redesign. "
+            "Use ONLY the provided numbers. NEVER invent values. "
+            "Follow NIOSH Applications Manual style exactly."
+        )
+
+        # ----------------------------------------------------
+        # 6) GENERAZIONE VERSIONE COMBINATA
+        # ----------------------------------------------------
+        rs_combined = ollama.chat(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )["message"]["content"].strip()
+
+        # ----------------------------------------------------
+        # 7) RETURN IDENTICO AL PATTERN DELLE ALTRE DUAL
+        # ----------------------------------------------------
+        return {
+            "rs_specific": rs_specific,
+            "rs_combined": rs_combined,
+        }

@@ -287,7 +287,7 @@ def generate_scientific_validation(df):
 
     # Calcolo metriche chiave globali
     mae = df["LI_Error_Abs"].mean()
-    rmse = np.sqrt(((df["Human_LI"] - df["AI_LI"]) ** 2)).mean()
+    rmse = np.sqrt(((df["Human_LI"] - df["AI_LI"]) ** 2).mean())
     correlation = df["Human_LI"].corr(df["AI_LI"])
 
     #  METRICHE SEMANTICHE

@@ -20,6 +20,69 @@ class NIOSHJobAnalysisGenerator:
         self.model = model
 
     # ---------- SYSTEM PROMPT SINGLE-TASK (TAG) ----------
+        # ---------- FEW-SHOT PROVIDER FOR GEMINI JUDGE ----------
+    def get_reference_examples(self, task_type: str) -> str:
+        """
+        Restituisce i few-shot corretti da usare come manifold stilistico
+        per il Gemini Judge, in base al tipo di task.
+        """
+
+        # SINGLE-TASK (default)
+        single_example = """
+ASSISTANT EXAMPLE:
+
+Paragraph 1:
+"The task variable data were measured directly at the workstation. The hands
+were located at a vertical height of 10 inches at the origin [V0:10] and 34 inches
+at the destination [V1:34]. The horizontal distance from the ankles was 18 inches
+at the origin [H0:18] and 14 inches at the destination [H1:14]. The lift involved
+20 degrees of torso rotation [A:20] and was performed at a frequency of
+2 lifts per minute [F:2] for a duration of less than one hour [DUR:<1h]. The
+resulting vertical travel distance was 24 inches [D:24]."
+
+Paragraph 2:
+"The hand-to-object coupling was classified as fair [COUP:fair]. Significant
+control of the load was not required at the destination [CTRL:false].  
+Using the multipliers and structure of the Revised NIOSH Lifting Equation,
+Recommended Weight Limits were determined for both the origin and the
+destination."
+"""
+
+        repetitive_example = """
+EXAMPLE — JOB ANALYSIS FOR REPETITIVE SINGLE-TASK
+
+USER PARAMETERS:
+W = 26 lbs
+H0 = 10 in
+H1 = 20 in
+V0 = 22 in
+V1 = 59 in
+A = 0°
+F = 3 lifts/min
+DUR = <1h
+COUP = fair
+CTRL = true
+
+ASSISTANT:
+"The task variable data were documented according to the Revised NIOSH Lifting Equation...
+[...] Significant control of the object is required at the destination [CTRL:true]."
+"""
+
+        multi_example = """
+ASSISTANT EXAMPLE — NIOSH MULTI-TASK
+
+Task 1 [TASK:1] involves a load of 28 lb [Wi:28], beginning at a vertical height of
+12 inches [V0i:12] and ending at 28 inches [V1i:28]...
+[...]
+The Composite Lifting Index for the entire job is 2.3 [CLI:2.3].
+"""
+
+        if task_type == "repetitive":
+            return repetitive_example
+        elif task_type == "multi":
+            return multi_example
+        else:
+            return single_example
 
     def _create_job_analysis_system_prompt(self) -> str:
         return """
@@ -253,7 +316,7 @@ When interpreting risk:
 
     # ---------- MULTI-TASK JOB ANALYSIS CON TAG ----------
 
-    def generate_multi_task_job_analysis(self, calc_result) -> str:
+    def generate_multi_task_job_analysis(self, calc_result,parameters) -> str:
         """
         Genera la JOB ANALYSIS MULTI-TASK usando SOLO i valori già calcolati
         da NIOSHCalculator.compute_multi_task(calc_result).
@@ -270,7 +333,7 @@ When interpreting risk:
 
         # -------- FEW-SHOT ESEMPIO (stile) --------
         fewshot = """
-ASSISTANT EXAMPLE — NIOSH MULTI-TASK JOB ANALYSIS
+ASSISTANT EXAMPLE — NIOSH MULTI-TASK 
 
 The job consists of multiple distinct lifting tasks, each characterized by
 different geometric demands and frequencies. Task 1 [TASK:1] involves a load
@@ -454,3 +517,143 @@ in NIOSH Applications Manual style:
 
     Total overall frequency: {total_frequency} lifts/min for {duration}.
     """
+
+    
+    def generate_dual_job_analysis(self, params: NIOSHParameters, task_type: str):
+        """
+        Restituisce:
+        - ja_specific: generata con lo stile specifico del task_type
+        - ja_combined: generata usando TUTTI i few-shot stile JA
+        """
+        # 1) Versione specifica
+        ja_specific = self.generate_job_analysis(params, task_type)
+
+        # 2) Versione combinata (usa tutti i reference examples insieme)
+        full_fewshot = (
+            self.get_reference_examples("single")
+            + "\n\n"
+            + self.get_reference_examples("repetitive")
+            + "\n\n"
+            + self.get_reference_examples("multi")
+        )
+
+        user_prompt = f"""
+    STYLE REFERENCES (ALL TOGETHER):
+    {full_fewshot}
+
+    NOW GENERATE A NEW JOB ANALYSIS USING THE FULL NIOSH MANIFOLD
+    BUT RESPECTING task_type = "{task_type}"
+
+    Parameters:
+    {params}
+    """
+
+        ja_combined = call_llm_with_system_prompt(
+            model=self.model,
+            system_prompt="You are an expert in NIOSH Job Analysis. Generate analysis strictly following NIOSH style.",
+            user_prompt=user_prompt,
+            temperature=0.0,
+        )
+
+        return {
+            "ja_specific": ja_specific,
+            "ja_combined": ja_combined,
+        }
+    def generate_multi_task_dual_job_analysis(self, calc_result, task_type: str = "multi"):
+        """
+        Restituisce due versioni della JOB ANALYSIS MULTI-TASK:
+        - ja_specific: generata con il few-shot MULTI originale
+        - ja_combined: generata usando TUTTI i few-shot JA (single + repetitive + multi)
+
+        Stessa struttura della funzione dual per Hazard Assessment.
+        """
+
+        # ----------------------------------------------------
+        # 1) VERSIONE SPECIFICA (standard multi-task)
+        # ----------------------------------------------------
+        ja_specific = self.generate_multi_task_job_analysis(calc_result, task_type)
+
+        # ----------------------------------------------------
+        # 2) COSTRUZIONE FEW-SHOT COMBINATO (SINGLE + REP + MULTI)
+        # ----------------------------------------------------
+        full_fewshot = (
+            "\n\n--- SINGLE-TASK JA EXAMPLE ---\n"
+            + self.get_reference_examples("single")
+            + "\n\n--- REPETITIVE-TASK JA EXAMPLE ---\n"
+            + self.get_reference_examples("repetitive")
+            + "\n\n--- MULTI-TASK JA EXAMPLE ---\n"
+            + self.get_reference_examples("multi")
+        )
+
+        # Ricostruzione blocchi TASK (come nella funzione specifica)
+        task_blocks = []
+        for t in calc_result.tasks:
+            task_blocks.append(
+                f"[TASK:{t.task_id}] "
+                f"[Wi:{t.weight_lbs}] "
+                f"[H0i:{t.horizontal_origin}] "
+                f"[H1i:{t.horizontal_destination}] "
+                f"[V0i:{t.vertical_origin}] "
+                f"[V1i:{t.vertical_destination}] "
+                f"[Ai:{t.asymmetry_angle}] "
+                f"[Fi:{t.frequency_lifts_per_min}] "
+                f"[RWLi:{t.strwl_lbs}] "
+                f"[LIi:{t.stli}] "
+                f"[COUPi:{t.coupling}]"
+            )
+
+        tasks_block_str = "\n".join(task_blocks)
+        duration = getattr(calc_result, "duration", "2-8h")
+
+        # ----------------------------------------------------
+        # 3) USER PROMPT PER VERSIONE COMBINATA
+        # ----------------------------------------------------
+        user_prompt = f"""
+    STYLE REFERENCES — FULL MANIFOLD OF JOB ANALYSIS:
+    {full_fewshot}
+
+    NOW GENERATE A NEW MULTI-TASK JOB ANALYSIS.
+
+    RULES (CRITICAL):
+    - You MUST respect task_type="multi".
+    - You MUST NOT invent or modify any numbers.
+    - Use ALL styles in the manifold to shape your narrative.
+    - Include all TAGS for each task exactly as provided.
+    - Interpret CLI using NIOSH risk logic.
+
+    JOB DESCRIPTION (context only):
+    {calc_result.job_description}
+
+    Composite Lifting Index:
+    CLI = {calc_result.cli} [CLI:{calc_result.cli}]
+    Risk category: {calc_result.risk_category}
+    Duration: [DUR:{duration}]
+
+    TASK DATA (from Python — MUST NOT BE CHANGED):
+    {tasks_block_str}
+    """
+
+        # ----------------------------------------------------
+        # 4) SYSTEM PROMPT (stile hazard dual)
+        # ----------------------------------------------------
+        system_prompt = (
+            "You are an expert in NIOSH Job Analysis (multi-task). "
+            "NEVER modify numerical values. "
+            "Follow the NIOSH Applications Manual exactly. "
+            "You MUST generate a multi-task Job Analysis with proper tags."
+        )
+
+        # ----------------------------------------------------
+        # 5) GENERAZIONE VERSIONE COMBINATA via ollama.chat
+        # ----------------------------------------------------
+        ja_combined = call_llm_with_system_prompt(
+            model=self.model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.0,
+        )
+
+        return {
+            "ja_specific": ja_specific,
+            "ja_combined": ja_combined,
+        }

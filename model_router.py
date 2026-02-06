@@ -12,60 +12,68 @@ from typing import Dict, Any, Optional
 import ollama
 import os
 
-# Configurazione Google Gemini API (come in gemini_comparator.py)
 try:
     from google import genai
     from google.genai import types
-
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print("Warning: GEMINI_API_KEY not found in env. Trying hardcoded (unsafe).")
-        api_key = "AIzaSyCVFCz9pwCEtiou0TmNLsQqb_Ca3eJiLiM"
-
-    # Usa client come in gemini_comparator.py
-    GEMINI_CLIENT = None
-    if genai is not None and api_key:
-        GEMINI_CLIENT = genai.Client(api_key=api_key)
-        GEMINI_AVAILABLE = True
-        GOOGLE_API_KEY = api_key
-    else:
-        GEMINI_AVAILABLE = False
-        GOOGLE_API_KEY = None
-        print("Google GenAI lib not installed or API Key missing.")
-
+    GEMINI_AVAILABLE = True
 except ImportError:
-    GEMINI_AVAILABLE = False
-    GOOGLE_API_KEY = None
-    GEMINI_CLIENT = None
     genai = None
     types = None
+    GEMINI_AVAILABLE = False
+    print("Google GenAI library non installata.")
 
+
+#  Inserisci qui le tue chiavi Gemini (funzionano in rotazione)
+GEMINI_KEYS = [
+    "AIzaSyClBcyE6mYxoeKUbcPAJ6L_4JhPQYn5Su4",
+    "AIzaSyDTT1WmCVMn_thrB16yV967tNZR6WDZYis",
+    "AIzaSyApbCyBHHB3NBb5pYABNRjHWE7eBDGaup0",
+    "AIzaSyBDRUTl_-2XDee-7oQ3u-IwQeo0unbnqHY",
+    "AIzaSyAdqSbNHSV226aC0re1pn5zB8RrutMlHJk",
+    "AIzaSyBaJ8qHEAUcSD06kmbqao1WZK_mM4BMsMk",
+    "AIzaSyCZHKosIjw3Vf_o7F_yEKWIVNvSOvhRu0M",
+]
+
+if not GEMINI_KEYS:
+    raise Exception("Nessuna chiave Gemini impostata in GEMINI_KEYS.")
+_current_key_index = 0
+_bad_keys = set()
+
+
+def _next_gemini_key():
+    """
+    Restituisce la prossima chiave NON presente nella blacklist.
+    Se tutte le chiavi sono invalide → errore chiaro.
+    """
+    global _current_key_index
+
+    available = [k for k in GEMINI_KEYS if k not in _bad_keys]
+
+    if not available:
+        raise Exception("Tutte le chiavi Gemini risultano invalide o scadute.")
+
+    key = available[_current_key_index % len(available)]
+    _current_key_index += 1
+    return key
+
+
+def _create_gemini_client():
+    """Crea un client Gemini con la prossima chiave valida."""
+    key = _next_gemini_key()
+    return genai.Client(api_key=key)
 
 def is_gemini_model(model_name: str) -> bool:
-    """Verifica se il modello è Gemini."""
     return model_name.startswith("gemini") or "gemini-" in model_name.lower()
 
 
-def call_llm_with_system_prompt(
-    model: str,
-    user_prompt: str,
-    system_prompt: str,
-    format_schema: Optional[Dict] = None,
-    temperature: float = 0.0,
-    **kwargs,
-) -> str:
-    """
-    Chiama un modello LLM mantenendo system prompt identico.
-    Supporta sia Ollama che Gemini con comportamento coerente.
-    """
+def call_llm_with_system_prompt(model: str, user_prompt: str, system_prompt: str,
+                                format_schema: Optional[Dict] = None,
+                                temperature: float = 0.0, **kwargs):
     if is_gemini_model(model):
-        return _call_gemini(
-            model, user_prompt, system_prompt, format_schema, temperature, **kwargs
-        )
-    else:
-        return _call_ollama(
-            model, user_prompt, system_prompt, format_schema, temperature, **kwargs
-        )
+        return _call_gemini(model, user_prompt, system_prompt, format_schema,
+                            temperature, **kwargs)
+    return _call_ollama(model, user_prompt, system_prompt, format_schema,
+                        temperature, **kwargs)
 
 
 def _call_ollama(
@@ -173,145 +181,118 @@ def _call_ollama(
     return ""
 
 
+
 def _call_gemini(
     model: str,
     user_prompt: str,
     system_prompt: str,
-    format_schema: Optional[Dict] = None,
-    temperature: float = 0.0,
+    format_schema: Optional[Dict],
+    temperature: float,
     **kwargs,
 ) -> str:
-    """
-    Chiama Gemini con comportamento coerente a Ollama.
-
-    Mantiene system prompt come concetto separato per coerenza,
-    supporta structured outputs e opzioni complete.
-    """
 
     if not GEMINI_AVAILABLE:
-        raise Exception("Gemini API not available - check API key")
+        raise Exception("Gemini API non disponibile.")
 
-    max_retries = 3
-    retry_delay = 5
+    max_retries = 8
+    retry_delay = 3
+
+    # costruiamo prompt unificato
+    prompt = (
+        "<SYSTEM_INSTRUCTIONS>\n" + system_prompt + "\n</SYSTEM_INSTRUCTIONS>\n"
+        "<USER_REQUEST>\n" + user_prompt + "\n</USER_REQUEST>\n"
+    )
+
+    if format_schema:
+        prompt += (
+            "<STRUCTURED_OUTPUT_FORMAT>\n"
+            "Return ONLY valid JSON matching this schema:\n"
+            f"{json.dumps(format_schema)}\n"
+            "</STRUCTURED_OUTPUT_FORMAT>\n"
+        )
 
     for attempt in range(max_retries):
+
         try:
-            # Costruisci prompt strutturato per mantenere separazione system/user
-            prompt_parts = [
-                f"<SYSTEM_INSTRUCTIONS>",
-                system_prompt,
-                f"</SYSTEM_INSTRUCTIONS>",
-                "",
-                f"<USER_REQUEST>",
-                user_prompt,
-                f"</USER_REQUEST>",
-            ]
+            client = _create_gemini_client()
 
-            # Se richiesto structured output, aggiungi istruzioni specifiche
-            if format_schema:
-                prompt_parts.extend(
-                    [
-                        "",
-                        f"<STRUCTURED_OUTPUT_FORMAT>",
-                        f"Return your response as valid JSON following this schema: {json.dumps(format_schema)}",
-                        f"Do not include any text outside the JSON structure.",
-                        f"CRITICAL: Always return valid JSON even if you have to make reasonable assumptions.",
-                        f"</STRUCTURED_OUTPUT_FORMAT>",
-                    ]
-                )
-
-            combined_prompt = "\n".join(prompt_parts)
-
-            # Configura Gemini con opzioni complete
             config_kwargs = {"temperature": temperature}
 
-            # Mappa opzioni Ollama → Gemini
             if "num_predict" in kwargs:
                 config_kwargs["max_output_tokens"] = kwargs["num_predict"]
-
             if "top_p" in kwargs:
                 config_kwargs["top_p"] = kwargs["top_p"]
-
             if "top_k" in kwargs:
                 config_kwargs["top_k"] = kwargs["top_k"]
 
             config = types.GenerateContentConfig(**config_kwargs)
 
-            # Genera contenuto
-            response = GEMINI_CLIENT.models.generate_content(
+            # CHIAMATA GEMINI
+            response = client.models.generate_content(
                 model=model,
-                contents=combined_prompt,
+                contents=prompt,
                 config=config,
             )
 
-            if response and response.text:
-                response_text = response.text.strip()
+            # risposta vuota?
+            if not response or not response.text:
+                time.sleep(retry_delay)
+                continue
 
-                if not response_text:
-                    print(
-                        f"Warning: Empty response from Gemini (attempt {attempt + 1})"
-                    )
-                    if attempt < max_retries - 1:
-                        time.sleep(retry_delay)
-                        continue
-                    return ""
+            text = response.text.strip()
 
-                # Se richiesto JSON, estrai e valida
-                if format_schema:
-                    json_content = _extract_json_from_gemini_response(response_text)
-
-                    # Try multiple validation approaches
-                    for validation_attempt in range(3):
+            # gestione JSON strutturato
+            if format_schema:
+                j = _extract_json_from_gemini_response(text)
+                if j:
+                    try:
+                        json.loads(j)
+                        return j
+                    except:
                         try:
-                            json.loads(json_content)
-                            return json_content
-                        except json.JSONDecodeError as json_error:
-                            if validation_attempt < 2:
-                                json_content = _fix_common_json_issues(json_content)
-                                continue
-                            else:
-                                # Final fallback: generate minimal valid JSON
-                                print(
-                                    f"Warning: Invalid JSON from Gemini, generating fallback (attempt {attempt + 1})"
-                                )
-                                return _generate_fallback_json(format_schema)
-                else:
-                    return response_text
-            else:
-                print(f"Warning: No response text from Gemini (attempt {attempt + 1})")
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
-                    continue
-                return ""
+                            fixed = _fix_common_json_issues(j)
+                            json.loads(fixed)
+                            return fixed
+                        except:
+                            return _generate_fallback_json(format_schema)
+
+            return text
 
         except Exception as e:
-            err_msg = str(e)
-            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
-                    continue
-                else:
-                    raise Exception(
-                        f"Gemini quota exceeded after {max_retries} attempts"
-                    )
-            else:
-                print(f"Gemini API error (attempt {attempt + 1}): {str(e)}")
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
-                    continue
-                else:
-                    raise Exception(
-                        f"Gemini API error after {max_retries} attempts: {str(e)}"
-                    )
+            message = str(e)
 
-    # Final fallback for structured outputs
+            # ============================================================
+            # 1) ERRORE CHIAVE SCADUTA → blacklist immediata
+            # ============================================================
+
+            if "API key expired" in message or "API_KEY_INVALID" in message:
+                bad_key = client._api_key if hasattr(client, "_api_key") else None
+                if bad_key:
+                    print(f"[GEMINI] Chiave scaduta → rimossa dalla rotazione: {bad_key}")
+                    _bad_keys.add(bad_key)
+                continue  # prova una nuova chiave
+
+            # ============================================================
+            # 2) QUOTA / RESOURCE_EXHAUSTED / 429 → nuova chiave
+            # ============================================================
+
+            if ("429" in message or
+                "RESOURCE_EXHAUSTED" in message or
+                "quota" in message.lower()):
+                print(f"[GEMINI] Quota esaurita (tentativo {attempt+1}) → cambio chiave")
+                time.sleep(retry_delay)
+                continue
+
+            # altri errori temporanei
+            print(f"[GEMINI] Errore temporaneo: {message}")
+            time.sleep(retry_delay)
+            continue
+
+    # fallback dopo max tentativi
     if format_schema:
-        print("All Gemini attempts failed, generating minimal fallback JSON")
         return _generate_fallback_json(format_schema)
 
     return ""
-
-
 def _extract_json_from_gemini_response(response_text: str) -> str:
     """
     Estrae JSON dalla risposta di Gemini.
@@ -386,8 +367,8 @@ def _fix_common_json_issues(json_str: str) -> str:
     # Correggi virgole finali comuni
     json_str = re.sub(r",(\s*[}\]])", r"\1", json_str)
 
-    # Correggi missing quotes in property names
-    json_str = re.sub(r"(\w+):", r'"\1":', json_str)
+    # Correggi missing quotes in property names (solo se non già quotati)
+    json_str = re.sub(r'(?<!["\'])\b([a-zA-Z_][a-zA-Z0-9_]*)\b(?=\s*:)', r'"\1"', json_str)
 
     # Prova a validare e correggere parentesi
     try:

@@ -91,12 +91,13 @@ class MultiTaskTaskResult:
     frequency_lifts_per_min: float
     duration: str
     coupling: str
+    significant_control: bool  # 🔹 AGGIUNTO
 
     # Multi-task specific calculations
-    firwl_lbs: float  # Frequency Independent RWL (FM = 1.0)
-    fili: float  # Frequency Independent LI = weight / FIRWL
-    strwl_lbs: float  # Single Task RWL (FIRWL × actual FM)
-    stli: float  # Single Task LI = weight / STRWL
+    firwl_lbs: float
+    fili: float
+    strwl_lbs: float
+    stli: float
 
     # Standard NIOSH calculations
     rwl_origin_lbs: float
@@ -109,19 +110,55 @@ class MultiTaskTaskResult:
     frequency_multiplier: float
 
     def compute_firwl_fili(self, load_constant: float = 51.0):
-        """Calcola FIRWL e FILI usando FM = 1.0"""
-        # RWL senza considerare la frequenza (FM = 1.0)
-        # RWL = LC × HM × VM × DM × AM × FM × CM
-        # Per FIRWL: FM = 1.0
-        lc = load_constant  # Load Constant (default 51.0, ma può variare)
-        hm = self.multipliers_origin["HM"]
-        vm = self.multipliers_origin["VM"]
-        dm = self.multipliers_origin["DM"]
-        am = self.multipliers_origin["AM"]
-        cm = self.multipliers_origin["CM"]
+        """
+        Calcola FIRWL e FILI in modo robusto e conforme alla RNLE.
+        Protezioni:
+            - se FIRWL = 0 → nessuna capacità raccomandata → FILI = ∞
+            - evita ZeroDivisionError
+            - evita moltiplicatori mancanti o non validi
+        """
 
-        self.firwl_lbs = lc * hm * vm * dm * am * 1.0 * cm  # FM = 1.0
-        self.fili = self.weight_lbs / self.firwl_lbs
+        # Load Constant RNLE (standard = 51 lb)
+        lc = float(load_constant)
+
+        # Recupero moltiplicatori (origine)
+        try:
+            hm = float(self.multipliers_origin.get("HM", 0))
+            vm = float(self.multipliers_origin.get("VM", 0))
+            dm = float(self.multipliers_origin.get("DM", 0))
+            am = float(self.multipliers_origin.get("AM", 0))
+            cm = float(self.multipliers_origin.get("CM", 0))
+        except Exception:
+            # Se qualunque moltiplicatore è invalido → RWL = 0
+            self.firwl_lbs = 0.0
+            self.fili = float("inf")
+            return
+
+        # FM = 1.0 per FIRWL
+        fm = 1.0
+
+        # Calcolo FIRWL
+        firwl = lc * hm * vm * dm * am * fm * cm
+
+        # Se per qualsiasi motivo FIRWL <= 0 → filì infinito
+        if firwl is None or firwl <= 0:
+            self.firwl_lbs = 0.0
+            self.fili = float("inf")
+            return
+
+        self.firwl_lbs = float(firwl)
+
+        # Calcolo FILI (Frequency-Independent Lifting Index)
+        weight = float(getattr(self, "weight_lbs", 0))
+
+        # Se peso non valido → LI non calcolabile
+        if weight <= 0:
+            self.fili = None
+            return
+
+        # Calcolo sicuro
+        self.fili = weight / self.firwl_lbs
+
 
     def compute_strwl_stli(self):
         """Calcola STRWL e STLI usando FM reali — con gestione errori"""
@@ -393,22 +430,7 @@ class NIOSHCalculator:
                 task_description=task_data.get("task_description", f"Task {i + 1}"),
                 weight_lbs=float(task_data["weight"]),
 
-                # inizializzati, verranno riempiti dai metodi compute_*
-                firwl_lbs=0.0,
-                fili=0.0,
-                strwl_lbs=0.0,
-                stli=0.0,
-
-                # risultati RNLE singolo-task
-                rwl_origin_lbs=single_result.rwl_origin_lbs,
-                rwl_destination_lbs=single_result.rwl_destination_lbs,
-                li_origin=single_result.li_origin,
-                li_destination=single_result.li_destination,
-                multipliers_origin=single_result.multipliers_origin,
-                multipliers_destination=single_result.multipliers_destination,
-                frequency_multiplier=fm,
-
-                # variabili geometriche e di esposizione
+                # INPUT PARAMETERS (devono stare PRIMA)
                 horizontal_origin=float(task_data["horizontal_origin"]),
                 horizontal_destination=float(task_data["horizontal_destination"]),
                 vertical_origin=float(task_data["vertical_origin"]),
@@ -417,6 +439,22 @@ class NIOSHCalculator:
                 frequency_lifts_per_min=float(task_data["frequency"]),
                 duration=task_data["duration"],
                 coupling=task_data["coupling"],
+                significant_control=bool(task_data.get("significant_control", False)),  # 🔹 OBBLIGATORIO
+
+                # MULTI-TASK CALCULATED FIELDS
+                firwl_lbs=0.0,
+                fili=0.0,
+                strwl_lbs=0.0,
+                stli=0.0,
+
+                # STANDARD SINGLE-TASK RNLE RESULTS
+                rwl_origin_lbs=single_result.rwl_origin_lbs,
+                rwl_destination_lbs=single_result.rwl_destination_lbs,
+                li_origin=single_result.li_origin,
+                li_destination=single_result.li_destination,
+                multipliers_origin=single_result.multipliers_origin,
+                multipliers_destination=single_result.multipliers_destination,
+                frequency_multiplier=fm,
             )
 
             # 4) Step RNLE multi-task

@@ -262,21 +262,15 @@ def create_risk_panel(risk_category: str, risk_comment: str) -> Panel:
 
 
 def create_status_panel(message: str, status_type: str = "info") -> Panel:
-    """Create status panels for different scenarios"""
-
     styles = {
-        "success": ("success",),
-        "warning": ("warning"),
-        "error": ("danger"),
-        "info": ("info"),
+        "success": "success",
+        "warning": "warning",
+        "error":   "danger",
+        "info":    "info",
     }
 
     style = styles.get(status_type, "info")
-
-    panel = Panel(f"[{style}]{message}[/]", border_style=style, padding=(0, 1))
-
-    return panel
-
+    return Panel(f"[{style}]{message}[/]", border_style=style, padding=(0, 1))
 
 def create_text_section_panel(
     text: str, title: str, border_style: str = "cyan"
@@ -309,8 +303,8 @@ def create_multi_task_summary(multi_task_result) -> Table:
     table.add_column("STLI", justify="right", style="result")
     table.add_column("Risk Level", style="result")
 
-    if hasattr(multi_task_result, "task_results"):
-        for i, task_result in enumerate(multi_task_result.task_results, 1):
+    if hasattr(multi_task_result, "tasks"):
+        for i, task_result in enumerate(multi_task_result.tasks, 1):
             risk_style = get_risk_style(task_result.risk_category)
             description = (
                 task_result.task_description[:40] + "..."
@@ -322,21 +316,20 @@ def create_multi_task_summary(multi_task_result) -> Table:
                 description,
                 f"{task_result.li_origin:.2f}",
                 (
-                    f"{multi_task_result.stli_values[i-1]:.2f}"
-                    if hasattr(multi_task_result, "stli_values")
-                    and i - 1 < len(multi_task_result.stli_values)
+                    f"{task_result.stli:.2f}"
+                    if hasattr(task_result, "stli") and task_result.stli is not None
                     else "N/A"
                 ),
                 f"[{risk_style}]{task_result.risk_category}[/]",
             )
 
         # Composite Lifting Index row
-        if hasattr(multi_task_result, "composite_lifting_index"):
+        if hasattr(multi_task_result, "cli"):
             table.add_row(
                 "",
                 "[bold cyan]COMPOSITE LIFTING INDEX (CLI)[/]",
                 "",
-                f"[bold magenta]{multi_task_result.composite_lifting_index:.2f}[/]",
+                f"[bold magenta]{multi_task_result.cli:.2f}[/]",
                 "",
             )
 
