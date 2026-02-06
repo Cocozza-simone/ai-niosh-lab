@@ -1,0 +1,2 @@
+model_name,count,job_description_score_AI_mean,job_description_score_AI_std,job_analysis_score_AI_mean,job_analysis_score_AI_std,hazard_assessment_score_AI_mean,hazard_assessment_score_AI_std,redesign_suggestions_score_AI_mean,redesign_suggestions_score_AI_std,total_mean,total_std
+unknown,60,6.817,0.541,8.357,0.928,6.742,0.659,7.642,0.8,7.389,0.362

@@ -1,0 +1,27 @@
+{
+  "job_description": {
+    "mean": 6.817,
+    "std": 0.541,
+    "count": 60
+  },
+  "job_analysis": {
+    "mean": 8.357,
+    "std": 0.928,
+    "count": 60
+  },
+  "hazard_assessment": {
+    "mean": 6.742,
+    "std": 0.659,
+    "count": 60
+  },
+  "redesign_suggestions": {
+    "mean": 7.642,
+    "std": 0.8,
+    "count": 60
+  },
+  "overall": {
+    "global_mean": 7.389,
+    "global_std": 0.362,
+    "total_examples": 60
+  }
+}

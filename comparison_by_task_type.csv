@@ -1,0 +1,4 @@
+task_type,count,job_description_score_AI_mean,job_description_score_AI_std,job_analysis_score_AI_mean,job_analysis_score_AI_std,hazard_assessment_score_AI_mean,hazard_assessment_score_AI_std,redesign_suggestions_score_AI_mean,redesign_suggestions_score_AI_std,total_mean,total_std
+multi,20,6.355,0.666,8.945,0.465,6.505,0.459,7.445,0.815,7.312,0.411
+repetitive,20,6.975,0.174,8.805,0.58,6.875,0.46,7.825,0.743,7.62,0.286
+single,20,7.12,0.295,7.32,0.644,6.845,0.914,7.655,0.835,7.235,0.264
